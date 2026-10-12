@@ -105,8 +105,14 @@ C_ABI_RUNTIME = """EXPECTED_RUNTIME = frozenset({
     "pf_abi_version",
 })
 """
-CI_VERIFY = """KERNEL_MIN_TESTS = 202
-RELEASE_MIN_TESTS = 572
+# RELEASE_MIN_TESTS / KERNEL_MIN_TESTS are plain module-level literals (the
+# proof kit reads them from the tree); the table references them.
+CI_VERIFY = """RELEASE_MIN_TESTS = 572
+KERNEL_MIN_TESTS = 202
+PRIVATE_FIXTURE_PROFILE_FLOORS = {
+    'release': (RELEASE_MIN_TESTS, 6),
+    'kernel': (KERNEL_MIN_TESTS, 5),
+}
 """
 INDEPENDENCE = """NATIVE_EXAMPLES = (
     ("hello-kernel", "examples/native/hello_kernel.cpp"),

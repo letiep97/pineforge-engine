@@ -9,14 +9,28 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import subprocess
+import sys
+
 from check_aggregate_cpp_versions import body
 from check_native_cpp_versions import (
     DRIVER_FORWARD, FILES, NATIVE_FX_CURVE_HEADER, NATIVE_FX_CURVE_SOURCE,
-    ROOT, authenticate_historical_host_manifests, check, check_fx_curve_introduced_at,
-    check_texts, load,
+    ROOT, PRIVATE_FIXTURE_SKIP_LITERAL as SCRIPT_SKIP_LITERAL,
+    authenticate_historical_host_manifests, check, check_fx_curve_introduced_at,
+    check_texts, historical_provider_inputs, load,
 )
 
 DATA = load()
+
+# The private-fixture PRs move tests/fixtures/native_cpp_abi/ out of the
+# public tree.  The controls below that authenticate those fixtures skip with
+# the project's pinned literal instead of failing inside them; every control
+# that reads only the tree keeps running in both worlds.
+PRIVATE_FIXTURE_SKIP_LITERAL = "SKIP private fixtures not present: "
+PRIVATE_FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "tests/fixtures/native_cpp_abi"
+requires_private_fixtures = unittest.skipUnless(
+    PRIVATE_FIXTURE_ROOT.exists(),
+    PRIVATE_FIXTURE_SKIP_LITERAL + "tests/fixtures/native_cpp_abi")
 
 
 class NativeVersions(unittest.TestCase):
@@ -794,6 +808,7 @@ class NativeVersions(unittest.TestCase):
                     compiler_flags=[compiler, '-std=c++17'], generated_include=str(root),
                     scratch=root, original_header_sha256='x')
 
+    @requires_private_fixtures
     def test_v14_tar_authentication_rejects_archive_and_manifest_tampering(self):
         from check_native_cpp_abi import FIXTURE, authenticate_v14_fixture
         fixture = FIXTURE / 'host-f736676'
@@ -818,6 +833,7 @@ class NativeVersions(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 authenticate_v14_fixture(mislabeled, root / 'bad-manifest')
 
+    @requires_private_fixtures
     def test_v15_frozen_tar_authentication_rejects_archive_and_manifest_tampering(self):
         from check_native_cpp_abi import FIXTURE, authenticate_v15_frozen_fixture
         fixture = FIXTURE / 'host-e7cdf05'
@@ -842,6 +858,7 @@ class NativeVersions(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 authenticate_v15_frozen_fixture(mislabeled, root / 'bad-manifest')
 
+    @requires_private_fixtures
     def test_v16_frozen_tar_authentication_rejects_archive_and_manifest_tampering(self):
         from check_native_cpp_abi import FIXTURE, authenticate_v16_frozen_fixture
         fixture = FIXTURE / 'host-ab9714b'
@@ -1019,6 +1036,7 @@ class NativeFxCurveVersions(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_texts(changed)
 
+    @requires_private_fixtures
     def test_introduced_at_authenticates_historical_host_closures(self):
         manifests = authenticate_historical_host_manifests()
         self.assertEqual(set(manifests), {'v13', 'v14'})
@@ -1036,6 +1054,7 @@ class NativeFxCurveVersions(unittest.TestCase):
                         check()
                     authenticate.assert_called_once_with(ROOT)
 
+    @requires_private_fixtures
     def test_introduced_at_cannot_skip_authentication_or_accept_wrong_identity(self):
         from prepare_settlement_cpp_abi_base import PROVIDERS
         with self.assertRaises(ValueError):
@@ -1046,6 +1065,7 @@ class NativeFxCurveVersions(unittest.TestCase):
             authenticate_historical_host_manifests(providers=providers)
 
 
+@requires_private_fixtures
 class FixtureAuthentication(unittest.TestCase):
     def test_authentic_fixtures_unpack(self):
         from check_native_cpp_abi import FIXTURE, authenticate_fixture
@@ -1141,5 +1161,97 @@ class NativeLayoutAssembly(unittest.TestCase):
                 assembly_layout_values(emitted, 2)
 
 
+class AbsentModeTextChecks(unittest.TestCase):
+    """R2-F4: the text half runs in the fixture-absent tree.
+
+    The controls run the REAL script as a subprocess over a scratch tree: the
+    three modules it imports and the twelve public sources, with no
+    tests/fixtures/native_cpp_abi. Before the fix the script exited 77 ahead
+    of check_texts, so a tampered public source passed in the absent tree; now
+    the text checks run first and their failure is the script's failure, while
+    the manifest half still reports the pinned skip.
+    """
+
+    def test_only_the_fixture_reading_classes_carry_the_skip(self):
+        # N8: this suite is a ctest row of the fixtures-absent run, so nothing
+        # at file scope may stand the whole row down -- only the classes and
+        # methods that genuinely read tests/fixtures/native_cpp_abi skip, each
+        # stating that reason. The public text half and the tree-reading
+        # classes run in both worlds whatever this tree holds.
+        module = sys.modules[__name__]
+        classes = {name: obj for name, obj in vars(module).items()
+                   if isinstance(obj, type) and issubclass(obj, unittest.TestCase)}
+        self.assertGreaterEqual(len(classes), 5)
+        fixture_reading = {'FixtureAuthentication'}
+        for name, cls in sorted(classes.items()):
+            with self.subTest(cls=name):
+                marked = bool(getattr(cls, '__unittest_skip__', False))
+                if name in fixture_reading:
+                    self.assertTrue(marked or PRIVATE_FIXTURE_ROOT.exists(),
+                                    f'{name} reads the fixtures and must carry '
+                                    f'requires_private_fixtures')
+                else:
+                    self.assertFalse(marked, f'{name} must run in the fixtures-absent tree')
+        self.assertIn('AbsentModeTextChecks', classes)
+
+    TAMPER = ('double price_tick = 0.0;', 'double price_tick = 1.0;')
+
+    def scratch_tree(self, tamper: bool) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        # The whole scripts directory: the script's imports are transitive and
+        # a subset would fail on whichever module it reaches next.
+        shutil.copytree(ROOT / 'scripts', root / 'scripts',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        for relative in FILES:
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            text = (ROOT / relative).read_text()
+            if tamper and relative == FILES[0]:
+                self.assertIn(self.TAMPER[0], text)
+                text = text.replace(*self.TAMPER, 1)
+            target.write_text(text)
+        return root
+
+    def run_script(self, root: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, '-B', str(root / 'scripts' / 'check_native_cpp_versions.py')],
+            cwd=root, capture_output=True, text=True, timeout=300)
+
+    def test_green_absent_untampered_the_partial_skip_still_prints(self):
+        result = self.run_script(self.scratch_tree(tamper=False))
+        self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
+        self.assertIn(SCRIPT_SKIP_LITERAL, result.stdout)
+        self.assertIn('text checks ran and passed', result.stdout)
+
+    def test_red_absent_a_tampered_public_source_fails_the_script(self):
+        # The check the absent tree used to skip: the ActivationGrid default is
+        # a check_texts pin, and a tree without fixtures must still refuse a
+        # changed one.
+        result = self.run_script(self.scratch_tree(tamper=True))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn(SCRIPT_SKIP_LITERAL, result.stdout)
+        self.assertIn('ActivationGrid', result.stderr)
+
+    def test_green_present_inputs_the_gate_opens_into_the_manifest_half(self):
+        # With the provider inputs nominally in place the script leaves the
+        # gate: the text half passes and the manifest half runs (and fails
+        # loudly on the empty stand-ins) -- never the skip.
+        root = self.scratch_tree(tamper=False)
+        for path in historical_provider_inputs(root):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'')
+        result = self.run_script(root)
+        self.assertNotEqual(result.returncode, 77, result.stdout)
+        self.assertNotIn(SCRIPT_SKIP_LITERAL, result.stdout)
+        self.assertIn('Traceback', result.stderr)
+
+
 if __name__ == "__main__":
+    # N8: no whole-file skip signal here. This row runs in the fixtures-absent
+    # CI; the classes that read tests/fixtures/native_cpp_abi skip THEMSELVES,
+    # each printing the pinned literal with its own path in its skip reason,
+    # and the public text half (AbsentModeTextChecks and every other
+    # tree-reading class) runs in both worlds.
     unittest.main()

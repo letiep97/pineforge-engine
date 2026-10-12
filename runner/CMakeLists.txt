@@ -207,6 +207,21 @@ if(PINEFORGE_BUILD_TESTS)
 endif()
 
 if(PINEFORGE_BUILD_TESTS AND PINEFORGE_BUILD_SOURCE_LAYER)
+    # PR 1b (private fixtures): everything below compiles fixtures whose second
+    # private-fixture removal takes them (checked_settings/generated.cpp,
+    # strategy_capabilities.cpp, strategy_capabilities/generated/*,
+    # confirmed_capabilities/*); with the fixtures absent every row below is
+    # registered as the pinned SKIP placeholder instead, so the public tree
+    # still configures and the rows stay visible (tests/private_fixture_rows.txt).
+    set(_pf_confirmed_cases htf5_close htf5_close_active htf15_sma htf15_sma_pooc htf60_close daily_close heikinashi5
+        htf60_ema_gaps period_previous pooc_dual_stop pooc_limit_reversal pooc_slipped_short
+        pooc_short_exit constant_daily helper5 heikinashi_alias5 varip pooc_market pooc_close pooc_close_entry
+        pooc_close_short pooc_close_short_entry)
+    if(EXISTS "${PROJECT_SOURCE_DIR}/tests/fixtures/checked_settings/generated.cpp"
+       AND EXISTS "${PROJECT_SOURCE_DIR}/tests/fixtures/strategy_capabilities.cpp"
+       AND EXISTS "${PROJECT_SOURCE_DIR}/tests/fixtures/strategy_capabilities/generated/close.cpp"
+       AND EXISTS "${PROJECT_SOURCE_DIR}/tests/fixtures/confirmed_capabilities/generated/htf5_close.cpp"
+       AND EXISTS "${PROJECT_SOURCE_DIR}/tests/fixtures/confirmed_capabilities/receipt_versions.cpp")
     add_library(checked_settings_example MODULE $<TARGET_OBJECTS:checked_settings_fixture>)
     target_link_libraries(checked_settings_example PRIVATE PineForge::pineforge)
     if(APPLE)
@@ -263,15 +278,6 @@ if(PINEFORGE_BUILD_TESTS AND PINEFORGE_BUILD_SOURCE_LAYER)
             COMMAND test_capabilities_equivalence_${capabilities_kind})
     endforeach()
     if(PINEFORGE_BUILD_SOURCE_LAYER)
-        add_executable(test_confirmed_capabilities ${PROJECT_SOURCE_DIR}/tests/test_confirmed_capabilities.cpp)
-        target_include_directories(test_confirmed_capabilities PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-        target_compile_features(test_confirmed_capabilities PRIVATE cxx_std_17)
-        target_compile_options(test_confirmed_capabilities PRIVATE -UNDEBUG)
-        add_test(NAME confirmed_capabilities_policy COMMAND test_confirmed_capabilities)
-        set(_pf_confirmed_cases htf5_close htf5_close_active htf15_sma htf15_sma_pooc htf60_close daily_close heikinashi5
-            htf60_ema_gaps period_previous pooc_dual_stop pooc_limit_reversal pooc_slipped_short
-            pooc_short_exit constant_daily helper5 heikinashi_alias5 varip pooc_market pooc_close pooc_close_entry
-            pooc_close_short pooc_close_short_entry)
         include("${PROJECT_SOURCE_DIR}/tests/confirmed_capabilities_refusals.cmake")
         set(_pf_confirmed_refusals)
         foreach(refusal_source IN LISTS _pf_confirmed_refusal_sources)
@@ -376,6 +382,95 @@ if(PINEFORGE_BUILD_TESTS AND PINEFORGE_BUILD_SOURCE_LAYER)
                 COMMAND test_confirmed_equivalence_${confirmed_control} ${_pf_confirmed_clock} 500)
         endforeach()
     endif()
+    else()
+        add_test(NAME checked_settings_e2e COMMAND ${CMAKE_COMMAND} -E echo "SKIP private fixtures not present: tests/fixtures/checked_settings/generated.cpp")
+        set_tests_properties(checked_settings_e2e PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP private fixtures not present: " LABELS private_fixtures)
+        add_test(NAME strategy_capabilities_e2e COMMAND ${CMAKE_COMMAND} -E echo "SKIP private fixtures not present: tests/fixtures/strategy_capabilities.cpp")
+        set_tests_properties(strategy_capabilities_e2e PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP private fixtures not present: " LABELS private_fixtures)
+        foreach(_pf_ph close clock_flags)
+            add_test(NAME capabilities_equivalence_${_pf_ph} COMMAND ${CMAKE_COMMAND} -E echo "SKIP private fixtures not present: tests/fixtures/strategy_capabilities/generated/${_pf_ph}.cpp")
+            set_tests_properties(capabilities_equivalence_${_pf_ph} PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP private fixtures not present: " LABELS private_fixtures)
+        endforeach()
+        add_test(NAME confirmed_capabilities_receipt_versions COMMAND ${CMAKE_COMMAND} -E echo "SKIP private fixtures not present: tests/fixtures/confirmed_capabilities/receipt_versions.cpp")
+        set_tests_properties(confirmed_capabilities_receipt_versions PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP private fixtures not present: " LABELS private_fixtures)
+        foreach(confirmed_case IN LISTS _pf_confirmed_cases)
+            if(confirmed_case MATCHES "^pooc_" OR confirmed_case STREQUAL "htf15_sma_pooc")
+                add_test(NAME confirmed_capabilities_${confirmed_case}_refusal_e2e COMMAND ${CMAKE_COMMAND} -E echo "SKIP private fixtures not present: tests/fixtures/confirmed_capabilities/generated/${confirmed_case}.cpp")
+                set_tests_properties(confirmed_capabilities_${confirmed_case}_refusal_e2e PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP private fixtures not present: " LABELS private_fixtures)
+            else()
+                add_test(NAME confirmed_capabilities_${confirmed_case}_e2e COMMAND ${CMAKE_COMMAND} -E echo "SKIP private fixtures not present: tests/fixtures/confirmed_capabilities/generated/${confirmed_case}.cpp")
+                set_tests_properties(confirmed_capabilities_${confirmed_case}_e2e PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP private fixtures not present: " LABELS private_fixtures)
+            endif()
+            add_test(NAME confirmed_capabilities_${confirmed_case}_equivalence COMMAND ${CMAKE_COMMAND} -E echo "SKIP private fixtures not present: tests/fixtures/confirmed_capabilities/generated/${confirmed_case}.cpp")
+            set_tests_properties(confirmed_capabilities_${confirmed_case}_equivalence PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP private fixtures not present: " LABELS private_fixtures)
+        endforeach()
+        foreach(confirmed_control htf5_close_active htf60_close)
+            if(confirmed_control STREQUAL "htf60_close")
+                set(_pf_confirmed_clock 15)
+            else()
+                set(_pf_confirmed_clock 5)
+            endif()
+            add_test(NAME confirmed_capabilities_${confirmed_control}_tf${_pf_confirmed_clock}_e2e COMMAND ${CMAKE_COMMAND} -E echo "SKIP private fixtures not present: tests/fixtures/confirmed_capabilities/generated/${confirmed_control}.cpp")
+            set_tests_properties(confirmed_capabilities_${confirmed_control}_tf${_pf_confirmed_clock}_e2e PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP private fixtures not present: " LABELS private_fixtures)
+            add_test(NAME confirmed_capabilities_${confirmed_control}_tf${_pf_confirmed_clock}_equivalence COMMAND ${CMAKE_COMMAND} -E echo "SKIP private fixtures not present: tests/fixtures/confirmed_capabilities/generated/${confirmed_control}.cpp")
+            set_tests_properties(confirmed_capabilities_${confirmed_control}_tf${_pf_confirmed_clock}_equivalence PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP private fixtures not present: " LABELS private_fixtures)
+        endforeach()
+        # The refusal shard rows above split the fixture-backed refusal
+        # libraries into 8-library batches: 3 request shards and 9 pooc shards
+        # over the pinned inventory (the 22 _pf_confirmed_cases plus the 67
+        # generated/refused_*.cpp files the fixture removal takes, partitioned
+        # by the same regex the present branch uses). The libraries cannot
+        # build here, so the shard names that inventory yields are pinned
+        # literally, once, each with the removed generated.cpp of its first
+        # library, so the row set does not shrink with the fixtures. The ROW
+        # list is sorted; the MARKER list is the first library of each shard in
+        # the row list's order, and it pairs with the rows by position,
+        # POP_FRONT consuming one per row. Drift guard: the two-world check
+        # re-derives both from the split over the live tree and requires them.
+        set(_pf_refusal_shard_rows
+            confirmed_capabilities_refusals_pooc_1
+            confirmed_capabilities_refusals_pooc_2
+            confirmed_capabilities_refusals_pooc_3
+            confirmed_capabilities_refusals_pooc_4
+            confirmed_capabilities_refusals_pooc_5
+            confirmed_capabilities_refusals_pooc_6
+            confirmed_capabilities_refusals_pooc_7
+            confirmed_capabilities_refusals_pooc_8
+            confirmed_capabilities_refusals_pooc_9
+            confirmed_capabilities_refusals_requests_1
+            confirmed_capabilities_refusals_requests_2
+            confirmed_capabilities_refusals_requests_3
+        )
+        set(_pf_refusal_shard_first_library
+            htf15_sma_pooc
+            pooc_close_short
+            refused_pooc_close_rule
+            refused_pooc_entry_alert
+            refused_pooc_fixed_limit
+            refused_pooc_mixed_market_bracket
+            refused_pooc_pending_bracket
+            refused_pooc_risk_direction
+            refused_pooc_varip
+            htf5_close
+            constant_daily
+            refused_clock_W
+        )
+        foreach(_pf_refusal_shard IN LISTS _pf_refusal_shard_rows)
+            list(POP_FRONT _pf_refusal_shard_first_library _pf_refusal_shard_marker)
+            add_test(NAME ${_pf_refusal_shard} COMMAND ${CMAKE_COMMAND} -E echo "SKIP private fixtures not present: tests/fixtures/confirmed_capabilities/generated/${_pf_refusal_shard_marker}.cpp")
+            set_tests_properties(${_pf_refusal_shard} PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP private fixtures not present: " LABELS private_fixtures)
+        endforeach()
+    endif()
+endif()
+
+# The confirmed-capabilities policy witness compiles no fixture; it stays
+# registered on the fixture-less tree too.
+if(PINEFORGE_BUILD_TESTS AND PINEFORGE_BUILD_SOURCE_LAYER)
+        add_executable(test_confirmed_capabilities ${PROJECT_SOURCE_DIR}/tests/test_confirmed_capabilities.cpp)
+        target_include_directories(test_confirmed_capabilities PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_features(test_confirmed_capabilities PRIVATE cxx_std_17)
+        target_compile_options(test_confirmed_capabilities PRIVATE -UNDEBUG)
+        add_test(NAME confirmed_capabilities_policy COMMAND test_confirmed_capabilities)
 endif()
 
 if(PINEFORGE_BUILD_TESTS AND PINEFORGE_BUILD_SOURCE_LAYER)

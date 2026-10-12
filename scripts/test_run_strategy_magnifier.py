@@ -19,6 +19,12 @@ stamps date the days (tests/fixtures/daily_magnifier); it reports
 """
 
 from __future__ import annotations
+import os as _pf_os
+
+_pf_private_fixture = _pf_os.path.join(_pf_os.path.dirname(_pf_os.path.dirname(_pf_os.path.abspath(__file__))), "tests", "fixtures", "magnifier_intrabars", "mi-ltf-f-1D", "meta.json")
+if not _pf_os.path.exists(_pf_private_fixture):
+    print("SKIP private fixtures not present: tests/fixtures/magnifier_intrabars/mi-ltf-f-1D/meta.json")
+    raise SystemExit(77)
 
 import contextlib
 import hashlib

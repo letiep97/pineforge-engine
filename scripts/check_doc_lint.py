@@ -68,7 +68,10 @@ The nine rules
    * the ``PF_API`` declarations of ``include/pineforge/native_c_api.h`` (and,
      beside them, of ``pineforge.h``, the runtime set
      ``scripts/check_c_abi_runtime.py`` pins, and their sum);
-   * ``KERNEL_MIN_TESTS`` / ``RELEASE_MIN_TESTS`` in ``scripts/ci_verify.py``;
+   * the kernel and release floor counts, read from the plain module-level
+     literals ``KERNEL_MIN_TESTS`` / ``RELEASE_MIN_TESTS`` in
+     ``scripts/ci_verify.py`` (the ``PRIVATE_FIXTURE_PROFILE_FLOORS`` table
+     references them);
    * the example manifest of ``scripts/check_native_include_independence.py``
      (how many sources, how many of them C).
 
@@ -412,9 +415,13 @@ def derived_counts(root: Path) -> dict[str, int | None]:
             counts['runtime'] = len(re.findall(r'"[A-Za-z_][A-Za-z0-9_]*"', block.group(1)))
     verify = read('scripts/ci_verify.py')
     if verify is not None:
+        # KERNEL_MIN_TESTS / RELEASE_MIN_TESTS are plain module-level integer
+        # literals (the table references them), so the counts come from those
+        # two lines, the place the numbers really live.
         for family, name in (('kernel-floor', 'KERNEL_MIN_TESTS'),
                              ('release-floor', 'RELEASE_MIN_TESTS')):
-            value = re.search(r'^' + name + r'\s*=\s*(\d+)\s*$', verify, re.MULTILINE)
+            value = re.search(r'^' + name + r'\s*=\s*(\d+)\s*(?:#.*)?$',
+                              verify, re.MULTILINE)
             if value:
                 counts[family] = int(value.group(1))
     manifest = read('scripts/check_native_include_independence.py')

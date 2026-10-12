@@ -11,6 +11,12 @@ unchanged.
 """
 
 from __future__ import annotations
+import os as _pf_os
+
+_pf_private_fixture = _pf_os.path.join(_pf_os.path.dirname(_pf_os.path.dirname(_pf_os.path.abspath(__file__))), "tests", "fixtures", "symbol_calendar", "xc-cal-aapl15", "calendar.json")
+if not _pf_os.path.exists(_pf_private_fixture):
+    print("SKIP private fixtures not present: tests/fixtures/symbol_calendar/xc-cal-aapl15/calendar.json")
+    raise SystemExit(77)
 
 import hashlib
 import json

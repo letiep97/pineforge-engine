@@ -9,6 +9,7 @@ ordering can be asserted. Root must still run the actual profiles.
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -73,6 +74,70 @@ from prepare_settlement_cpp_abi_base import (
 )
 
 
+_SENTINEL = object()
+_PRIOR_OVERLAY_FLAG: object = _SENTINEL
+
+# The campaign's per-profile floors, read from the one table in ci_verify so a
+# test never restates a number the table owns. `FULL` is the overlay-present
+# floor (every one of those rows must run); `ABSENT` is the public floor, the
+# full population minus the pinned private-fixture rows that profile registers
+# as SKIP placeholders without the overlay.
+FULL_FLOOR = {name: entry[0] for name, entry in ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS.items()}
+ABSENT_FLOOR = {name: entry[0] - entry[1]
+                for name, entry in ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS.items()}
+
+
+def guard_environment() -> dict:
+    """The environment the harness hands a REAL source guard (`extra_env`).
+
+    The ctest row pins TMPDIR to ``<build>/tmp`` (tests/CMakeLists.txt,
+    ENVIRONMENT), and a ctest build dir is a child of the source tree, so the
+    pin resolves inside the repository. check_native_cpp_versions.py refuses
+    that -- 'system temporary directory is inside the repository', raised
+    before it extracts a historical provider -- and the Scripted harness
+    executes that guard for real against ROOT, so in the OVERLAY world every
+    scripted Driver test died at source-guard-native-versions; only there,
+    because with the overlay absent the same guard answers its pinned 77
+    before it ever needs a temp area, which is why the absent world never saw
+    this. A real guard therefore runs with a temp area its own contract
+    allows: the environment's own when it already lies outside the tree (a
+    dev shell's TMPDIR under /var/folders), else the platform temp dir the
+    row's pin replaced. The row's pinned TMPDIR still governs the harness's
+    own tamper trees, which never leave the build dir.
+    """
+    repository = ROOT.resolve()
+    current = Path(tempfile.gettempdir()).resolve()
+    if current != repository and repository not in current.parents:
+        return {'TMPDIR': str(current)}
+    saved = tempfile.tempdir
+    masked = {name: os.environ.pop(name)
+              for name in ('TMPDIR', 'TEMP', 'TMP') if name in os.environ}
+    try:
+        tempfile.tempdir = None
+        return {'TMPDIR': tempfile.gettempdir()}
+    finally:
+        tempfile.tempdir = saved
+        os.environ.update(masked)
+
+
+def setUpModule():
+    # The module describes the tree it runs on: the fixture-absent public
+    # world. PINEFORGE_PRIVATE_FIXTURES must be absent for it, because the
+    # Scripted harness executes the real source guards, and a real guard
+    # whose private input the tree lacks exits 77 -- accepted only while the
+    # overlay is absent (R2-F3). The overlay-present controls set the flag
+    # themselves (overlay_present / RowFloorDriver).
+    global _PRIOR_OVERLAY_FLAG
+    _PRIOR_OVERLAY_FLAG = os.environ.get('PINEFORGE_PRIVATE_FIXTURES', _SENTINEL)
+    os.environ.pop('PINEFORGE_PRIVATE_FIXTURES', None)
+
+
+def tearDownModule():
+    global _PRIOR_OVERLAY_FLAG
+    if _PRIOR_OVERLAY_FLAG is not _SENTINEL:
+        os.environ['PINEFORGE_PRIVATE_FIXTURES'] = str(_PRIOR_OVERLAY_FLAG)
+
+
 def write_cache(path: Path, values: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f'{key}:STRING={value}' for key, value in values.items()]
@@ -87,12 +152,13 @@ def which_with_ccache(ccache: str | None):
     return which
 
 
-def ctest_output(total: int, skipped=(), not_run=()) -> bytes:
+def ctest_output(total: int, skipped=(), not_run=(), disabled=()) -> bytes:
     """CTest 4.4's console shape for a run of `total` rows, as ci_verify reads it.
 
     Each skipped or not-run row prints its own result line during the run and
     is listed again after the closing summary, which counts it inside `total`
-    (a skipped row as passed, a not-run row as failed).
+    (a skipped row as passed, a not-run row as failed). A disabled row is
+    listed the same way but CTest leaves it out of `total`.
     """
     lines = ['Test project /scripted/build']
     for number, name in enumerate(skipped, 1):
@@ -106,9 +172,11 @@ def ctest_output(total: int, skipped=(), not_run=()) -> bytes:
     else:
         lines.append(f'\n100% tests passed out of {total}')
     lines.append('\nTotal Test time (real) =   1.00 sec')
-    if skipped:
+    if skipped or disabled:
         lines.append('\nThe following tests did not run:')
         lines += [f'\t{number:3} - {name} (Skipped)' for number, name in enumerate(skipped, 1)]
+        lines += [f'\t{number:3} - {name} (Disabled)'
+                  for number, name in enumerate(disabled, len(skipped) + 1)]
     if not_run:
         lines.append('\nThe following tests FAILED:')
         lines += [f'\t{number:3} - {name} (Not Run)'
@@ -190,6 +258,11 @@ class Scripted:
             return Completed(int(self.exits.get(key, 0)), b'fetched\n', b'')
         if any(Path(part).name == 'prepare_settlement_cpp_abi_base.py' for part in argv):
             key = self.provider_command_name(argv, 'prepare')
+            if self.exits.get(key) == 'skip-77':
+                # The absent-overlay shape: the preparer answers a missing
+                # private-fixture manifest with the pinned literal and exit 77.
+                return Completed(77, b'SKIP private fixtures not present: '
+                                 b'tests/fixtures/native_cpp_abi/host-f736676/manifest.json\n', b'')
             return Completed(int(self.exits.get(key, 0)), b'prepared\n', b'')
         if any(Path(part).name == 'check_native_include_independence.py' for part in argv):
             return Completed(int(self.exits.get('native-include-independence', 0)),
@@ -210,8 +283,15 @@ class Scripted:
             }
             for key, needle in needles.items():
                 if key in self.exits and any(needle in part for part in argv):
+                    if self.exits[key] == 'skip-77':
+                        # The absent-overlay shape: exit 77 with the pinned
+                        # literal naming the missing fixture path.
+                        return Completed(77,
+                                         b'SKIP private fixtures not present: '
+                                         b'tests/fixtures/native_cpp_abi/host-fixture/headers.tar\n',
+                                         b'')
                     return Completed(int(self.exits[key]), b'', b'injected source-guard failure\n')
-            return default_runner(argv, extra_env=None, timeout=timeout,
+            return default_runner(argv, extra_env=guard_environment(), timeout=timeout,
                                   combine_stderr=True, stream_output=False)
         if argv[0] == 'cmake' and '-S' in argv and 'smoke_consumer' in joined:
             return Completed(int(self.exits.get('smoke-configure', 0)), b'ok\n', b'')
@@ -248,9 +328,26 @@ class Scripted:
                 stage = 'ctest-list-selected' if '-LE' in argv else 'ctest-list-all'
                 if self.exits.get(stage) == 'unreadable':
                     return Completed(0, b'CTest list has no total\n', b'')
+                if self.exits.get(stage) == 'names-less':
+                    # A listing whose count parses but carries no row names:
+                    # the registry the pinned-rows-that-ran rule reads.
+                    count = registered - labelled if '-LE' in argv else registered
+                    return Completed(0, f'Total Tests: {count}\n'.encode(), b'')
                 count = registered - labelled if '-LE' in argv else registered
+                # Every row a run scripts as skipped/not-run/disabled is
+                # registered by its own row, exactly as a real `ctest -N`
+                # lists it; the rest of the registry is filler names.
+                names = list(self.exits.get('ctest_registered_names', ()))
+                for implied in (self.exits.get('ctest_skipped', ()),
+                                self.exits.get('ctest_not_run', ()),
+                                self.exits.get('ctest_disabled', ())):
+                    names += [name for name in implied if name not in names]
+                while len(names) < count:
+                    names.append(f'test_row_{len(names) + 1}')
+                listing = ''.join(f'Test #{number}: {name}\n'
+                                  for number, name in enumerate(names[:count], 1))
                 return Completed(int(self.exits.get(stage, 0)),
-                                 f'Total Tests: {count}\n'.encode(), b'')
+                                 (listing + f'Total Tests: {count}\n').encode(), b'')
             env_ok = True
             if ci_verify.PROFILE[self.profile].sanitizers:
                 env_ok = extra_env == SANITIZER_RUN_ENV
@@ -270,7 +367,8 @@ class Scripted:
             if rows == 'absent':
                 return Completed(int(self.exits.get('ctest', 0)), b'tests\n', b'')
             summary = ctest_output(rows, self.exits.get('ctest_skipped', ()),
-                                   self.exits.get('ctest_not_run', ()))
+                                   self.exits.get('ctest_not_run', ()),
+                                   self.exits.get('ctest_disabled', ()))
             return Completed(int(self.exits.get('ctest', 0)), summary, b'')
         if argv[0].endswith('smoke_version') or Path(argv[0]).name == 'smoke_version':
             stdout = str(self.exits.get('smoke-stdout', expected_version(self.source))).encode() + b'\n'
@@ -615,13 +713,21 @@ class RowFloorConfig(unittest.TestCase):
         self.assertEqual(main(['kernel', '--min-tests', '0']), 2)
 
     def test_kernel_and_release_carry_a_row_floor_and_the_others_do_not(self):
-        # expectation corrected: release min_tests None -> RELEASE_MIN_TESTS,
-        # because lane P7 gives the release profile a row floor (a row that
-        # left release alone failed nothing).
-        for name, floor in (('kernel', KERNEL_MIN_TESTS), ('release', RELEASE_MIN_TESTS)):
+        # The two campaign profiles carry the FULL overlay-present floor from
+        # PRIVATE_FIXTURE_PROFILE_FLOORS; the module runs with the overlay
+        # present, so that is the value validate_config resolves. --min-tests
+        # replaces it verbatim.
+        for name in ('kernel', 'release'):
             with self.subTest(profile=name):
-                self.assertEqual(ci_verify.PROFILE[name].min_tests, floor)
-                self.assertEqual(validate_config(parse_args([name])).min_tests, floor)
+                self.assertEqual(ci_verify.PROFILE[name].min_tests, FULL_FLOOR[name])
+                # The module runs in the fixture-absent world: the effective
+                # default is the table's absent floor. With the overlay set it
+                # is the full population (proved in PrivateFixtureFloors).
+                self.assertEqual(validate_config(parse_args([name])).min_tests,
+                                 ABSENT_FLOOR[name])
+                with mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': '1'}):
+                    self.assertEqual(validate_config(parse_args([name])).min_tests,
+                                     FULL_FLOOR[name])
                 self.assertEqual(
                     validate_config(parse_args([name, '--min-tests', '9'])).min_tests, 9)
         for name in ('debug', 'sanitizers', 'native'):
@@ -941,6 +1047,55 @@ class CopyCacheIdentity(unittest.TestCase):
         receipt_matches_current(receipt, cache, compiler)
 
 
+class HistoricalProviderPinTable(unittest.TestCase):
+    """The provider pin table itself -- no archive is read, so both worlds run it.
+
+    R2-F11: the replaced skip keyed the whole class on a directory probe, which
+    also silenced assertions that need no private data. The pins below hold in
+    the fixture-absent tree exactly as in the overlay one; only the closure
+    digests and the authentication controls are gated (on the overlay flag, in
+    HistoricalProviderPins).
+    """
+
+    def test_all_historical_roles_pin_their_own_engine_epoch(self):
+        self.assertEqual({role: provider['engine_epoch'] for role, provider in PROVIDERS.items()}, {
+            'e60': 'engine_script_run_v13', '0e': 'engine_script_run_v13',
+            'v13': 'engine_script_run_v13', 'v14': 'engine_script_run_v14',
+            'v15-frozen': 'engine_script_run_v15',
+            'v16-frozen': 'engine_script_run_v16',
+            'v18-frozen': 'engine_script_run_v18',
+        })
+
+    def test_each_host_provider_pins_commit_tree_and_closure_paths(self):
+        for role, commit, tree, host, output in (
+                ('v14', V14_COMMIT, V14_TREE, 'host-f736676', 'native-abi-v14'),
+                ('v15-frozen', V15_FROZEN_COMMIT, V15_FROZEN_TREE, 'host-e7cdf05',
+                 'native-abi-v15-frozen'),
+                ('v16-frozen', V16_FROZEN_COMMIT, V16_FROZEN_TREE, 'host-ab9714b',
+                 'native-abi-v16-frozen'),
+                ('v18-frozen', V18_FROZEN_COMMIT, V18_FROZEN_TREE, 'host-fc7aad6',
+                 'native-abi-v18-frozen')):
+            with self.subTest(role=role):
+                provider = PROVIDERS[role]
+                self.assertEqual(provider['commit'], commit)
+                self.assertEqual(provider['tree'], tree)
+                self.assertEqual(provider['manifest'],
+                                 ROOT / 'tests/fixtures/native_cpp_abi' / host / 'manifest.json')
+                self.assertEqual(provider['default_output'], output)
+                self.assertEqual(provider['headers_name'], 'headers.tar')
+
+
+# The overlay FLAG, not a directory probe, decides whether the host-* header
+# closures are here (R2-F11): under the campaign a tree that carries the files
+# but runs without the flag is the absent world's job, and one that runs with
+# the flag must fail loudly if the closures are missing rather than skip.
+requires_private_closures = unittest.skipUnless(
+    ci_verify.private_fixtures_overlay(),
+    'private fixtures not present: the host-* header closures are '
+    'moved out of the public tree (tests/private_fixture_rows.txt)')
+
+
+@requires_private_closures
 class HistoricalProviderPins(unittest.TestCase):
     def test_v18_frozen_preparation_uses_the_fc7aad6_header_closure(self):
         provider = PROVIDERS['v18-frozen']
@@ -989,15 +1144,6 @@ class HistoricalProviderPins(unittest.TestCase):
         archive = provider['manifest'].parent / provider['headers_name']
         self.assertEqual(identity(archive)['sha256'],
                          '37e9340e0a985db118006e7e3b265e0191445285ce5e8fd8fc77f1578275e28e')
-
-    def test_all_historical_roles_pin_their_own_engine_epoch(self):
-        self.assertEqual({role: provider['engine_epoch'] for role, provider in PROVIDERS.items()}, {
-            'e60': 'engine_script_run_v13', '0e': 'engine_script_run_v13',
-            'v13': 'engine_script_run_v13', 'v14': 'engine_script_run_v14',
-            'v15-frozen': 'engine_script_run_v15',
-            'v16-frozen': 'engine_script_run_v16',
-            'v18-frozen': 'engine_script_run_v18',
-        })
 
     def test_host_provider_epoch_matches_its_authenticated_header_owner(self):
         for role in ('v13', 'v14', 'v15-frozen', 'v16-frozen', 'v18-frozen'):
@@ -1314,8 +1460,20 @@ class DriverOrderingAndAggregation(unittest.TestCase):
     def test_source_guards_are_real_and_pass_on_this_tree(self):
         for name, argv in source_guard_commands(ROOT):
             with self.subTest(name=name):
-                result = default_runner(argv, extra_env=None, timeout=120,
+                result = default_runner(argv, extra_env=guard_environment(), timeout=120,
                                         combine_stderr=True, stream_output=False)
+                if result.returncode == 77:
+                    # A guard whose private fixture input the tree lacks skips
+                    # with the pinned literal naming the missing path -- and
+                    # only that: the named file must really be absent.
+                    output = (result.stdout + result.stderr).decode('utf-8', 'replace')
+                    literal = ci_verify.PRIVATE_FIXTURE_SKIP_LITERAL
+                    self.assertIn(literal, output, output[-2000:])
+                    named = output.split(literal, 1)[1].strip().splitlines()[0]
+                    self.assertGreater(len(named), 0, 'the skip must name a path')
+                    self.assertFalse((ROOT / named).exists(),
+                                     named + ' exists, so the skip is not earned')
+                    continue
                 self.assertEqual(result.returncode, 0, result.stdout[-2000:])
 
     def test_corpus_submodule_is_initialized_before_source_guards(self):
@@ -1352,6 +1510,62 @@ class DriverOrderingAndAggregation(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('source-guard-c-abi', failure_stages(summary))
         self.assertFalse(any(argv[0] == 'cmake' and '-S' in argv for argv in scripted.calls))
+
+    def test_source_guard_77_without_the_literal_is_a_failure(self):
+        # The private-fixture skip is the pinned literal; a bare 77 is not one.
+        code, summary, scripted, _ = self.run_profile(**{'source-guard-c-abi': 77})
+        self.assertEqual(code, 1)
+        self.assertIn('source-guard-c-abi', failure_stages(summary))
+        self.assertFalse(any(argv[0] == 'cmake' and '-S' in argv for argv in scripted.calls))
+
+    def test_source_guard_77_with_the_pinned_literal_is_a_named_skip(self):
+        # GREEN half of the R2-F3 control: with the overlay ABSENT (this
+        # module's world) the guard's 77 + literal is the contract and the run
+        # goes on.
+        code, summary, scripted, _ = self.run_profile(
+            **{'source-guard-native-versions': 'skip-77'})
+        self.assertEqual(code, 0, summary['failures'])
+        stage = next(stage for stage in summary['stages']
+                     if stage['name'] == 'source-guard-native-versions')
+        self.assertEqual(stage['status'], 'skipped')
+        self.assertEqual(stage['exitCode'], 77)
+        self.assertFalse(failure_stages(summary))
+        self.assertTrue(any(argv[0] == 'cmake' and '-S' in argv for argv in scripted.calls))
+
+    def test_red_overlay_present_a_source_guard_skip_is_refused(self):
+        # RED half of the R2-F3 control: with PINEFORGE_PRIVATE_FIXTURES set
+        # the guard's private input is in the tree, so the same 77 + literal is
+        # a failure -- and configure never runs.
+        with mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': '1'}):
+            code, summary, scripted, _ = self.run_profile(
+                **{'source-guard-c-abi': 'skip-77'})
+        self.assertEqual(code, 1)
+        self.assertIn('source-guard-c-abi', failure_stages(summary))
+        stage = next(stage for stage in summary['stages']
+                     if stage['name'] == 'source-guard-c-abi')
+        self.assertEqual(stage['status'], 'failed')
+        self.assertFalse(any(argv[0] == 'cmake' and '-S' in argv for argv in scripted.calls))
+
+    def test_green_overlay_absent_an_abi_preparer_skip_is_a_skip(self):
+        # GREEN half of the preparer control: absent the overlay, the
+        # receipt-gated provider cannot be prepared and its 77 + literal is a
+        # skip the run goes on past.
+        code, summary, _, _ = self.run_profile(**{'v14-prepare': 'skip-77'})
+        self.assertEqual(code, 0, summary['failures'])
+        stage = next(stage for stage in summary['stages'] if stage['name'] == 'abi-v14')
+        self.assertEqual(stage['status'], 'skipped')
+
+    def test_red_overlay_present_an_abi_preparer_skip_is_refused(self):
+        # RED half: with the overlay present the providers' manifests are in
+        # the tree, so a preparer that reports one absent did not receive the
+        # overlay -- a failure (R2-F3).
+        with mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': '1'}):
+            # The real fixture-absent guard is scripted out so the run reaches
+            # the ABI providers; its own refusal is the control above.
+            code, summary, _, _ = self.run_profile(
+                **{'v14-prepare': 'skip-77', 'source-guard-native-versions': 0})
+        self.assertEqual(code, 1)
+        self.assertIn('abi-v14', failure_stages(summary))
 
     def test_adapter_spec_shadowing_guard_failure_skips_configure(self):
         # R5 N11 registered this check as a CTest row only, so a shadowed spec
@@ -1968,7 +2182,17 @@ class DriverOrderingAndAggregation(unittest.TestCase):
 
 
 class RowFloorDriver(unittest.TestCase):
-    run_profile = DriverOrderingAndAggregation.run_profile
+    """The floor stage in the OVERLAY-PRESENT world:
+
+    the full PRIVATE_FIXTURE_PROFILE_FLOORS population must run, and a skip
+    of any row is a lost row. The absent-world controls live in
+    PrivateFixtureFloors, which sets the flag itself.
+    """
+
+    def run_profile(self, profile='release', extra=None, **exits):
+        exits.setdefault('source-guard-native-versions', 0)
+        with mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': '1'}):
+            return DriverOrderingAndAggregation.run_profile(self, profile, extra=extra, **exits)
 
     def test_kernel_floor_passes_when_ctest_reports_enough_rows(self):
         code, summary, _, _ = self.run_profile('kernel')
@@ -1977,20 +2201,20 @@ class RowFloorDriver(unittest.TestCase):
         self.assertIn('ctest-floor', names)
         self.assertLess(names.index('ctest'), names.index('ctest-floor'))
         self.assertLess(names.index('ctest-floor'), names.index('install'))
-        self.assertEqual(summary['minTests'], KERNEL_MIN_TESTS)
-        self.assertEqual(summary['ctestRows'], KERNEL_MIN_TESTS)
+        self.assertEqual(summary['minTests'], FULL_FLOOR['kernel'])
+        self.assertEqual(summary['ctestRows'], FULL_FLOOR['kernel'])
 
     def test_kernel_floor_fails_below_it_without_hiding_package_checks(self):
-        code, summary, scripted, _ = self.run_profile('kernel', ctest_rows=KERNEL_MIN_TESTS - 1)
+        code, summary, scripted, _ = self.run_profile('kernel', ctest_rows=FULL_FLOOR['kernel'] - 1)
         self.assertEqual(code, 1)
         self.assertIn('ctest-floor', failure_stages(summary))
         self.assertNotIn('ctest', failure_stages(summary))
         self.assertIn('install', scripted.names())
         self.assertIn('smoke-version', scripted.names())
         error = next(item['error'] for item in summary['failures'] if item['stage'] == 'ctest-floor')
-        self.assertIn(str(KERNEL_MIN_TESTS - 1), error)
-        self.assertIn(str(KERNEL_MIN_TESTS), error)
-        self.assertEqual(summary['ctestRows'], KERNEL_MIN_TESTS - 1)
+        self.assertIn(str(FULL_FLOOR['kernel'] - 1), error)
+        self.assertIn(str(FULL_FLOOR['kernel']), error)
+        self.assertEqual(summary['ctestRows'], FULL_FLOOR['kernel'] - 1)
 
     def test_kernel_floor_fails_closed_without_a_row_count(self):
         code, summary, _, _ = self.run_profile('kernel', ctest_rows='absent')
@@ -1999,48 +2223,51 @@ class RowFloorDriver(unittest.TestCase):
         self.assertIsNone(summary['ctestRows'])
 
     def test_release_floor_fails_below_it_without_hiding_package_checks(self):
-        code, summary, scripted, _ = self.run_profile('release', ctest_rows=RELEASE_MIN_TESTS - 1)
+        code, summary, scripted, _ = self.run_profile('release', ctest_rows=FULL_FLOOR['release'] - 1)
         self.assertEqual(code, 1)
         self.assertIn('ctest-floor', failure_stages(summary))
         self.assertNotIn('ctest', failure_stages(summary))
         self.assertIn('install', scripted.names())
         self.assertIn('smoke-version', scripted.names())
         error = next(item['error'] for item in summary['failures'] if item['stage'] == 'ctest-floor')
-        self.assertIn(str(RELEASE_MIN_TESTS - 1), error)
-        self.assertIn(str(RELEASE_MIN_TESTS), error)
+        self.assertIn(str(FULL_FLOOR['release'] - 1), error)
+        self.assertIn(str(FULL_FLOOR['release']), error)
         self.assertIn('release profile', error)
-        self.assertEqual(summary['minTests'], RELEASE_MIN_TESTS)
+        self.assertEqual(summary['minTests'], FULL_FLOOR['release'])
 
     def test_release_floor_passes_at_it_and_fails_closed_without_a_row_count(self):
         code, summary, _, _ = self.run_profile('release')
         self.assertEqual(code, 0, summary['failures'])
         names = stage_names(summary)
         self.assertLess(names.index('ctest'), names.index('ctest-floor'))
-        self.assertEqual(summary['ctestRows'], RELEASE_MIN_TESTS)
+        self.assertEqual(summary['ctestRows'], FULL_FLOOR['release'])
         code, summary, _, _ = self.run_profile('release', ctest_rows='absent')
         self.assertEqual(code, 1)
         self.assertIn('ctest-floor', failure_stages(summary))
 
     def test_floor_counts_rows_that_ran_and_lists_a_skipped_row_beside_them(self):
-        # The kernel profile as it runs where libcurl lacks WebSocket support:
-        # one row more registered than the floor, and that row skipped.
+        # The floor counts the rows that RAN: one row more registered than the
+        # floor, and that row skipped, leaves the ran count exactly at the
+        # floor -- which passes -- with the skip listed beside the count.
         code, summary, _, build_dir = self.run_profile(
-            'kernel', ctest_rows=KERNEL_MIN_TESTS + 1,
+            'kernel', ctest_rows=FULL_FLOOR['kernel'] + 1,
             ctest_skipped=['test_native_live_websocket'])
         self.assertEqual(code, 0, summary['failures'])
-        self.assertEqual(summary['ctestRows'], KERNEL_MIN_TESTS)
-        self.assertEqual(summary['ctestTotal'], KERNEL_MIN_TESTS + 1)
+        self.assertEqual(summary['ctestRows'], FULL_FLOOR['kernel'])
+        self.assertEqual(summary['ctestTotal'], FULL_FLOOR['kernel'] + 1)
         self.assertEqual(summary['ctestSkipped'], ['test_native_live_websocket'])
         self.assertEqual(summary['ctestNotRun'], [])
         self.assertEqual(summary['ctestDisabled'], [])
         log = (build_dir / 'ci-logs' / 'ctest-floor.log').read_text()
-        self.assertIn(f'ctest ran {KERNEL_MIN_TESTS} rows (floor {KERNEL_MIN_TESTS})', log)
+        self.assertIn(f'ctest ran {FULL_FLOOR["kernel"]} rows (floor '
+                      f'{FULL_FLOOR["kernel"]})', log)
         self.assertIn('not counted: 1 skipped (test_native_live_websocket)', log)
 
     def test_a_row_that_stops_running_trips_the_floor_though_ctest_still_counts_it(self):
         # CTest's own count includes a skipped row, so before lane Q12 a row
         # that began to skip left the count at the floor and passed.
-        for profile, floor in (('kernel', KERNEL_MIN_TESTS), ('release', RELEASE_MIN_TESTS)):
+        for profile in ('kernel', 'release'):
+            floor = FULL_FLOOR[profile]
             with self.subTest(profile=profile):
                 code, summary, scripted, _ = self.run_profile(
                     profile, ctest_rows=floor, ctest_skipped=['test_quietly_skipping'])
@@ -2057,19 +2284,20 @@ class RowFloorDriver(unittest.TestCase):
 
     def test_a_row_ctest_could_not_start_is_not_counted_either(self):
         code, summary, _, _ = self.run_profile(
-            'kernel', ctest=8, ctest_rows=KERNEL_MIN_TESTS, ctest_not_run=['test_missing_binary'])
+            'kernel', ctest=8, ctest_rows=FULL_FLOOR['kernel'],
+            ctest_not_run=['test_missing_binary'])
         self.assertEqual(code, 1)
         self.assertIn('ctest', failure_stages(summary))
         self.assertIn('ctest-floor', failure_stages(summary))
-        self.assertEqual(summary['ctestRows'], KERNEL_MIN_TESTS - 1)
+        self.assertEqual(summary['ctestRows'], FULL_FLOOR['kernel'] - 1)
         self.assertEqual(summary['ctestNotRun'], ['test_missing_binary'])
 
     def test_the_floor_still_trips_on_a_real_collapse(self):
         # Every kernel row but one skips, with CTest's count still at the
         # floor; and a release suite that simply shrank.
-        skipped = [f'test_row_{number}' for number in range(KERNEL_MIN_TESTS - 1)]
+        skipped = [f'test_row_{number}' for number in range(FULL_FLOOR['kernel'] - 1)]
         code, summary, _, _ = self.run_profile(
-            'kernel', ctest_rows=KERNEL_MIN_TESTS, ctest_skipped=skipped)
+            'kernel', ctest_rows=FULL_FLOOR['kernel'], ctest_skipped=skipped)
         self.assertEqual(code, 1)
         self.assertIn('ctest-floor', failure_stages(summary))
         self.assertEqual(summary['ctestRows'], 1)
@@ -2088,6 +2316,10 @@ class RowFloorDriver(unittest.TestCase):
         error = next(item['error'] for item in summary['failures']
                      if item['stage'] == 'ctest-floor')
         self.assertIn('cannot read', error)
+
+    def overlay_absent(self):
+        # Empty is the unset spelling: the flag counts only when non-empty.
+        return mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': ''})
 
     def test_min_tests_override_gates_the_rows_that_ran(self):
         # --min-tests stays the override (fail-closed below 1, see
@@ -2128,6 +2360,1106 @@ class RowFloorDriver(unittest.TestCase):
                 self.assertEqual(code, 0, summary['failures'])
                 self.assertEqual(summary['minTests'], 2)
                 self.assertIn('ctest-floor', stage_names(summary))
+
+
+PRIVATE_FIXTURE_LABEL_CALL = re.compile(
+    r'set_tests_properties\(\s*(?P<rows>[^()]*?)\s+PROPERTIES\b[^()]*?\bLABELS\s+'
+    + re.escape(ci_verify.PRIVATE_FIXTURE_LABEL) + r'\b')
+ROW_VARIABLE = re.compile(r'\$\{([A-Za-z_]\w*)\}')
+CMAKE_HEAD = re.compile(r'^\s*([A-Za-z_]\w*)\s*\(')
+
+
+def _cmake_statements(text: str):
+    """Split CMake text into (line number, statement) pairs at balanced parens."""
+    statements, buffer, depth, line = [], [], 0, 0
+    for number, raw in enumerate(text.splitlines(), 1):
+        stripped = raw.strip()
+        if not buffer and (not stripped or stripped.startswith('#')):
+            continue
+        if not buffer:
+            line = number
+        buffer.append(raw)
+        depth += raw.count('(') - raw.count(')')
+        if depth <= 0:
+            statements.append((line, '\n'.join(buffer)))
+            buffer, depth = [], 0
+    if buffer:
+        statements.append((line, '\n'.join(buffer)))
+    return statements
+
+
+def _statement_arguments(statement: str) -> str:
+    return statement[statement.index('(') + 1:statement.rindex(')')]
+
+
+def _split_values(fragment: str):
+    return [token for token in fragment.replace('\n', ' ').split() if token]
+
+
+def _substitute(token: str, bindings: dict, environment: dict, *, path, line: int, text: str,
+                depth: int = 0):
+    """One token with every ${variable} resolved from the surrounding walk.
+
+    set() values stay raw in the environment and are resolved here on use, so
+    a variable that never reaches a row name cannot fail the walk; one that
+    does reach a row name raises ValueError naming file:line -- the walk never
+    emits a row name it cannot read.
+    """
+    def resolve(match):
+        name = match.group(1)
+        if name in bindings:
+            return str(bindings[name])
+        if name in environment and depth < 8:
+            return ';'.join(_substitute(item, bindings, environment, path=path,
+                                        line=line, text=text, depth=depth + 1)
+                            for item in environment[name])
+        raise ValueError(
+            f'{path}:{line}: cannot expand ${{{name}}} in {token!r}; the '
+            'private_fixtures label walk does not skip what it cannot read')
+    return ROW_VARIABLE.sub(resolve, token)
+
+
+class _LabelWalk:
+    """Expands the row names of LABELS private_fixtures calls, or raises.
+
+    The walk models set(), list(APPEND), foreach (literal / IN ITEMS /
+    IN LISTS over a bound list) and if(<bound variable> STREQUAL "<literal>"),
+    which are the forms tests/CMakeLists.txt and runner/CMakeLists.txt use to
+    bind a labelled row's name. A foreach or include() whose list it cannot
+    resolve, or a row name carrying a variable it cannot resolve, raises with
+    file:line -- never a silently smaller population. An if() whose condition
+    it does not model is walked on BOTH branches: the pinned file is the union
+    over both worlds (fixtures present / absent), so union is the right
+    reading there, while a STREQUAL on a bound loop variable must pick one
+    branch because the branch bodies bind different clock values.
+    """
+
+    def __init__(self):
+        self.names = set()
+        self.path = Path('.')
+        self.text = ''
+        self.statements = []
+
+    def walk_file(self, path: Path) -> None:
+        self.visited = set()
+        self._walk_into(Path(path), {}, {})
+
+    def _walk_into(self, path: Path, bindings: dict, environment: dict) -> None:
+        """Run one CMake file's statements in the current scope (include() is
+        CMake semantics: same scope, and a label inside the included file
+        counts exactly like one here)."""
+        path = Path(path).resolve()
+        if path in self.visited:
+            return
+        self.visited.add(path)
+        previous = self.path, self.text, self.statements
+        self.path, self.text = path, path.read_text()
+        self.statements = _cmake_statements(self.text)
+        self._run(0, len(self.statements), bindings, environment)
+        self.path, self.text, self.statements = previous
+
+    def _body_carries_labels(self, start: int, end: int) -> bool:
+        return any(ci_verify.PRIVATE_FIXTURE_LABEL in self.statements[index][1]
+                   for index in range(start, end))
+
+    def _statement_carries_labels(self, statement: str) -> bool:
+        return (statement.lstrip().startswith('set_tests_properties')
+                and ci_verify.PRIVATE_FIXTURE_LABEL in statement)
+
+    def _block_bounds(self, index: int):
+        """(body_end, else_index, block_end) for the if/foreach at `index`."""
+        depth, else_index = 0, None
+        for cursor in range(index, len(self.statements)):
+            head = CMAKE_HEAD.match(self.statements[cursor][1])
+            head = head.group(1) if head else ''
+            if head in ('if', 'foreach'):
+                depth += 1
+            elif head in ('endif', 'endforeach'):
+                depth -= 1
+                if depth == 0:
+                    return cursor, else_index, cursor
+            elif head == 'else' and depth == 1:
+                else_index = cursor
+        raise ValueError(f'{self.path}:{self.statements[index][0]}: unclosed block')
+
+    def _run(self, start: int, end: int, bindings: dict, environment: dict) -> None:
+        index = start
+        while index < end:
+            line, statement = self.statements[index]
+            head = CMAKE_HEAD.match(statement)
+            head = head.group(1) if head else ''
+            if head == 'set':
+                values = _split_values(_statement_arguments(statement))
+                environment[values[0].strip('"')] = list(values[1:])
+                index += 1
+            elif head == 'list' and _split_values(_statement_arguments(statement))[:1] == ['APPEND']:
+                values = _split_values(_statement_arguments(statement))
+                environment.setdefault(values[1].strip('"'), []).extend(values[2:])
+                index += 1
+            elif head == 'foreach':
+                body_end, _, block_end = self._block_bounds(index)
+                header = _split_values(_statement_arguments(statement))
+                variable, items = None, []
+                if len(header) >= 3 and header[1] == 'IN' and header[2] == 'LISTS':
+                    variable = header[0]
+                    try:
+                        for list_name in header[3:]:
+                            items.extend(environment[list_name])
+                    except KeyError as error:
+                        if self._body_carries_labels(index + 1, body_end):
+                            raise ValueError(
+                                f'{self.path}:{line}: cannot resolve the foreach list '
+                                f'{error.args[0]!r} in a block carrying a '
+                                f'{ci_verify.PRIVATE_FIXTURE_LABEL} label') from error
+                        index = block_end + 1
+                        continue
+                elif len(header) >= 2 and header[1] == 'IN' and header[2] == 'ITEMS':
+                    variable, items = header[0], header[3:]
+                elif header:
+                    variable, items = header[0], header[1:]
+                else:
+                    raise ValueError(f'{self.path}:{line}: unreadable foreach header')
+                for item in items:
+                    try:
+                        bindings[variable] = _substitute(item, bindings, environment,
+                                                         path=self.path, line=line,
+                                                         text=self.text)
+                    except ValueError:
+                        if self._body_carries_labels(index + 1, body_end):
+                            raise
+                        continue
+                    self._run(index + 1, body_end, bindings, environment)
+                bindings.pop(variable, None)
+                index = block_end + 1
+            elif head == 'if':
+                body_end, else_index, block_end = self._block_bounds(index)
+                taken = _condition_value(_statement_arguments(statement), bindings,
+                                         environment)
+                if self._statement_carries_labels(statement):
+                    raise ValueError(f'{self.path}:{line}: unreadable condition {statement!r}')
+                then_end = else_index if else_index is not None else body_end
+                if taken is True or taken is None:
+                    self._run(index + 1, then_end, bindings, environment)
+                if taken is False or taken is None:
+                    if else_index is not None:
+                        self._run(else_index + 1, block_end, bindings, environment)
+                index = block_end + 1
+            elif head == 'set_tests_properties':
+                if ci_verify.PRIVATE_FIXTURE_LABEL in statement:
+                    match = PRIVATE_FIXTURE_LABEL_CALL.search(statement)
+                    if not match:
+                        raise ValueError(
+                            f'{self.path}:{line}: a {ci_verify.PRIVATE_FIXTURE_LABEL} '
+                            'call in a shape this walk cannot read')
+                    for token in _split_values(match.group('rows')):
+                        self.names.add(_substitute(token, bindings, environment,
+                                                   path=self.path, line=line,
+                                                   text=self.text))
+                index += 1
+            elif head == 'include':
+                arguments = _split_values(_statement_arguments(statement))
+                if not arguments:
+                    raise ValueError(f'{self.path}:{line}: unreadable include()')
+                target = arguments[0].strip('"')
+                target = target.replace('${PROJECT_SOURCE_DIR}', str(_project_root(self.path)))
+                target = target.replace('${CMAKE_CURRENT_SOURCE_DIR}', str(self.path.parent))
+                if ROW_VARIABLE.search(target):
+                    raise ValueError(
+                        f'{self.path}:{line}: cannot resolve {target!r}; the walk '
+                        'refuses rather than skipping the include')
+                included = Path(target)
+                if not included.is_file():
+                    raise ValueError(
+                        f'{self.path}:{line}: include({target!r}) names no file; '
+                        'the walk refuses rather than skipping it')
+                self._walk_into(included, bindings, environment)
+                index += 1
+            else:
+                index += 1
+
+
+def _condition_value(argument: str, bindings: dict, environment: dict):
+    """True/False when the condition is decidable on loop bindings, else None.
+
+    The forms the two files use on labelled rows are `VAR STREQUAL "lit"` and
+    `VAR MATCHES "re"` (OR-connected) on a bound loop variable; those decide
+    exactly which name a per-case branch registers, so they must be evaluated,
+    not union-walked. Every other condition (EXISTS/TARGET/flags) depends on
+    the world, and there both branches register the SAME row name, so the walk
+    takes both (the pinned file is the union over both worlds).
+    """
+    terms = [term for term in re.split(r'\s+OR\s+', argument.strip()) if term]
+    values = []
+    for term in terms:
+        tokens = _split_values(term)
+        value = None
+        if len(tokens) == 3 and tokens[1] in ('STREQUAL', 'MATCHES') \
+                and tokens[0] in bindings:
+            subject, literal = str(bindings[tokens[0]]), tokens[2].strip('"')
+            if tokens[1] == 'STREQUAL':
+                value = subject == literal
+            else:
+                value = re.search(literal, subject) is not None
+        values.append(value)
+    if any(value is True for value in values):
+        return True
+    return None if any(value is None for value in values) else False
+
+
+def _project_root(path: Path) -> Path:
+    # The two files that register rows sit one directory under the source root.
+    return path.parent.parent if path.parent.name in ('tests', 'runner') else path.parent
+
+
+def labelled_private_fixture_rows(*cmake_paths):
+    """The ctest rows a CMake file labels ``private_fixtures``.
+
+    Every ``set_tests_properties(... PROPERTIES ... LABELS private_fixtures)``
+    call contributes every row name it lists, expanded through the loops the
+    file binds them with (see _LabelWalk). A variable, foreach list or
+    include() the walk cannot resolve raises ValueError with file:line -- the
+    comparison fails loudly instead of comparing against a silently smaller
+    labelled set (the T7 hole: the population was a quiet subset).
+    """
+    walk = _LabelWalk()
+    for path in cmake_paths:
+        walk.walk_file(path)
+    return walk.names
+
+
+class PrivateFixtureFloors(unittest.TestCase):
+    """The overlay-aware floors and the private_fixtures skip rule.
+
+    PINEFORGE_PRIVATE_FIXTURES selects the world. Set (Lab's overlay is present)
+    the full floors apply and a skipped private_fixtures row is a failure;
+    unset (public CI) the two RUN floors drop by the pinned private row count
+    and the placeholder skips are expected. Each rule has a red and a green
+    control here.
+    """
+
+    def run_profile(self, profile='release', extra=None, **exits):
+        # The Scripted harness executes the real source guards. This tree has
+        # no private fixtures, so check_native_cpp_versions genuinely exits 77
+        # in BOTH asserted worlds -- accepted while the overlay is absent, a
+        # failure under it (R2-F3). The controls here are about the floor and
+        # the skip rule, so that one guard is scripted as the world leaves it
+        # (it runs and passes), like the ABI preparers; a control that wants
+        # its skip passes 'skip-77' explicitly.
+        exits.setdefault('source-guard-native-versions', 0)
+        return DriverOrderingAndAggregation.run_profile(self, profile, extra=extra, **exits)
+
+    def overlay_present(self):
+        return mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': '1'})
+
+    def overlay_absent(self):
+        # Empty is the unset spelling: the flag counts only when non-empty.
+        return mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': ''})
+
+    def test_pinned_rows_are_exactly_the_labelled_ctest_rows(self):
+        # The skip rule reads the rows by their label, and the label's
+        # population is the pinned file P1-B commits. Prove the two agree over
+        # BOTH files that register rows, so a labelled row cannot be missed and
+        # an unlabelled one cannot be refused. The reader expands the literal
+        # foreach forms it finds and raises on a row name it cannot resolve, so
+        # a label it cannot read fails here instead of shrinking the set
+        # silently (the T7 hole: the population must never be a quiet subset).
+        labelled = labelled_private_fixture_rows(
+            ROOT / 'tests' / 'CMakeLists.txt', ROOT / 'runner' / 'CMakeLists.txt')
+        pinned = set(ci_verify.private_fixture_rows(ROOT))
+        self.assertEqual(len(pinned), ci_verify.PRIVATE_FIXTURE_ROW_COUNT)
+        self.assertEqual(pinned, labelled)
+
+    def test_red_the_comparison_fails_on_a_real_mismatch(self):
+        # RED control for the test above: the same reader over tampered copies.
+        # A labelled row the pin does not carry, a pinned row whose label is
+        # gone, and a row name the reader cannot expand must each surface --
+        # an extra name, a missing name, and a loud ValueError -- never a
+        # silently equal set.
+        tests_text = (ROOT / 'tests' / 'CMakeLists.txt').read_text()
+        runner_text = (ROOT / 'runner' / 'CMakeLists.txt').read_text()
+        pinned = set(ci_verify.private_fixture_rows(ROOT))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'tests').mkdir()
+            (root / 'runner').mkdir()
+            (root / 'runner' / 'CMakeLists.txt').write_text(runner_text)
+            # The walk follows include(); the labs file the runner includes must
+            # sit beside the copies, or the walk correctly refuses.
+            shutil.copyfile(ROOT / 'tests' / 'confirmed_capabilities_refusals.cmake',
+                            root / 'tests' / 'confirmed_capabilities_refusals.cmake')
+            label = 'LABELS ' + ci_verify.PRIVATE_FIXTURE_LABEL
+
+            (root / 'tests' / 'CMakeLists.txt').write_text(
+                tests_text + '\nset_tests_properties(test_row_not_in_the_pin PROPERTIES '
+                + label + ')\n')
+            labelled = labelled_private_fixture_rows(
+                root / 'tests' / 'CMakeLists.txt', root / 'runner' / 'CMakeLists.txt')
+            self.assertIn('test_row_not_in_the_pin', labelled - pinned)
+            self.assertNotEqual(pinned, labelled)
+
+            first_label = tests_text.index(label)
+            (root / 'tests' / 'CMakeLists.txt').write_text(
+                tests_text.replace(label, 'LABELS private_fixture_typo', 1))
+            labelled = labelled_private_fixture_rows(
+                root / 'tests' / 'CMakeLists.txt', root / 'runner' / 'CMakeLists.txt')
+            self.assertTrue(pinned - labelled)
+            self.assertNotEqual(pinned, labelled)
+
+            (root / 'tests' / 'CMakeLists.txt').write_text(
+                tests_text + '\nset_tests_properties(test_${never_bound_variable} PROPERTIES '
+                + label + ')\n')
+            with self.assertRaises(ValueError) as caught:
+                labelled_private_fixture_rows(
+                    root / 'tests' / 'CMakeLists.txt', root / 'runner' / 'CMakeLists.txt')
+            self.assertIn('never_bound_variable', str(caught.exception))
+            self.assertIn('CMakeLists.txt:', str(caught.exception))
+            self.assertIn('tests', str(caught.exception))
+            self.assertGreater(first_label, 0)
+
+    def test_the_table_is_the_floor_and_profiles_outside_it_keep_their_own(self):
+        # The floors are constants of the profile, read from ONE table; the
+        # overlay flag picks between the table's two readings and nothing else
+        # feeds them. A profile outside the table keeps its declared value, and
+        # PRIVATE_FIXTURE_ROW_COUNT bounds the pinned half by construction.
+        self.assertEqual(ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS,
+                         {'release': (910, 300), 'kernel': (337, 28)})
+        self.assertEqual(FULL_FLOOR, {'release': 910, 'kernel': 337})
+        self.assertEqual(ABSENT_FLOOR, {'release': 610, 'kernel': 309})
+        for name, (full, pinned) in ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS.items():
+            with self.subTest(profile=name):
+                self.assertEqual(ci_verify.PROFILE[name].min_tests, full)
+                self.assertLessEqual(pinned, ci_verify.PRIVATE_FIXTURE_ROW_COUNT)
+        with self.overlay_absent():
+            self.assertFalse(ci_verify.private_fixtures_overlay())
+            self.assertIsNone(ci_verify.overlay_aware_floor(ci_verify.PROFILE['debug']))
+            self.assertIsNone(ci_verify.overlay_aware_floor(ci_verify.PROFILE['native']))
+            self.assertEqual(ci_verify.overlay_aware_floor(ci_verify.PROFILE['live-sanitizers']),
+                             LIVE_SANITIZERS_MIN_TESTS)
+            for name in ('release', 'kernel'):
+                self.assertEqual(ci_verify.overlay_aware_floor(ci_verify.PROFILE[name]),
+                                 ABSENT_FLOOR[name])
+            self.assertEqual(ci_verify.profile_min_tests(ci_verify.PROFILE['kernel'], ROOT),
+                             ABSENT_FLOOR['kernel'])
+            self.assertEqual(validate_config(parse_args(['release'])).min_tests,
+                             ABSENT_FLOOR['release'])
+        with self.overlay_present():
+            for name in ('release', 'kernel'):
+                self.assertEqual(ci_verify.overlay_aware_floor(ci_verify.PROFILE[name]),
+                                 FULL_FLOOR[name])
+            self.assertEqual(ci_verify.profile_min_tests(ci_verify.PROFILE['release'], ROOT),
+                             FULL_FLOOR['release'])
+            self.assertEqual(validate_config(parse_args(['kernel'])).min_tests,
+                             FULL_FLOOR['kernel'])
+        self.assertEqual(ci_verify.EXCLUDED_REGISTERED_MIN,
+                         {'debug': 876, 'sanitizers': 867, 'native': 963})
+
+    def test_overlay_flag_moves_the_floor_and_is_the_only_input(self):
+        # F9: the flag must MOVE the value. A test that only reads the
+        # overlay-present result cannot fail -- the replaced one never passed
+        # the observed skips, so it read the full floor whatever the flag said.
+        # This one pins both readings against the table in the same test, so
+        # dropping the overlay branch (or the table) fails it either way.
+        for name in ('release', 'kernel'):
+            with self.subTest(profile=name):
+                with self.overlay_present():
+                    self.assertEqual(ci_verify.overlay_aware_floor(ci_verify.PROFILE[name]),
+                                     FULL_FLOOR[name])
+                with self.overlay_absent():
+                    floor = ci_verify.overlay_aware_floor(ci_verify.PROFILE[name])
+                    self.assertNotEqual(floor, FULL_FLOOR[name])
+                    self.assertEqual(floor, ABSENT_FLOOR[name])
+
+    def test_green_overlay_present_all_private_rows_run(self):
+        # GREEN (flag set): every private_fixtures row runs, so the run passes.
+        with self.overlay_present():
+            code, summary, _, _ = self.run_profile('release')
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertIn('ctest-private-fixtures', stage_names(summary))
+        self.assertEqual(summary['ctestRows'], FULL_FLOOR['release'])
+
+    def test_red_overlay_present_a_private_row_that_skips_fails(self):
+        # RED (flag set): a private_fixtures row that did not run fails, naming
+        # the row and the literal it printed. One row more than the floor runs,
+        # so only the private_fixtures rule fails -- the floor itself is met.
+        with self.overlay_present():
+            code, summary, _, _ = self.run_profile(
+                'release', ctest_rows=FULL_FLOOR['release'] + 1,
+                ctest_skipped=['test_aapl15_margin_brackets_l4a'])
+        self.assertEqual(code, 1)
+        self.assertEqual(failure_stages(summary), ['ctest-private-fixtures'])
+        error = summary['failures'][0]['error']
+        self.assertIn('test_aapl15_margin_brackets_l4a', error)
+        self.assertIn(ci_verify.PRIVATE_FIXTURE_SKIP_LITERAL, error)
+        self.assertIn('the overlay did not reach the tree', error)
+
+    def test_red_overlay_present_unreadable_row_lists_fail_closed(self):
+        # F10: with the overlay present and the row lists unreadable, the rule
+        # must fail closed -- a floorless profile (debug) has no floor stage to
+        # catch it, so a silent return here would pass a run whose CTest output
+        # proves nothing.
+        with self.overlay_present():
+            code, summary, _, _ = self.run_profile(
+                'debug', ctest=8, ctest_raw=b'98% tests passed, 3 tests failed out of 999\n')
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-private-fixtures', failure_stages(summary))
+
+    def test_red_overlay_present_a_disabled_pinned_row_fails(self):
+        # F10: a Disabled pinned row is not run either, and CTest leaves it out
+        # of its own count, so only this rule can refuse it.
+        with self.overlay_present():
+            code, summary, _, _ = self.run_profile(
+                'debug', ctest_rows=5,
+                ctest_disabled=['test_aapl15_margin_brackets_l4a'])
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-private-fixtures', failure_stages(summary))
+        self.assertIn('test_aapl15_margin_brackets_l4a', summary['failures'][0]['error'])
+
+    def pinned_probe(self, count: int) -> list:
+        """`count` names that really are in tests/private_fixture_rows.txt."""
+        return sorted(ci_verify.private_fixture_rows(ROOT))[:count]
+
+    def test_red_overlay_present_a_truncated_pin_fails_closed(self):
+        # F10: a pin file that does not carry the count its own header records
+        # cannot speak for the pinned population; the rule refuses it instead
+        # of clearing every row it lost. The real Driver method runs against a
+        # scratch source whose pin is truncated in half.
+        with self.overlay_present(), tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / 'tests').mkdir()
+            (source / 'VERSION').write_text('0.0.0\n')
+            rows = (ROOT / 'tests' / 'private_fixture_rows.txt').read_text().splitlines()
+            (source / 'tests' / 'private_fixture_rows.txt').write_text(
+                '\n'.join(rows[:len(rows) // 2]) + '\n')
+            cfg = ci_verify.build_config(
+                ['kernel', '--build-dir', str(source / 'build')], source=source,
+                runner=default_runner, stream_output=False)
+            driver = ci_verify.Driver(cfg)
+            driver.reject_private_fixture_skips(ci_verify.CTestRows(337))
+        self.assertEqual([stage['status'] for stage in driver.stages], ['failed'])
+        self.assertIn('a truncated pin cannot clear the rows it lost',
+                      driver.stages[0]['error'])
+
+    def test_green_overlay_present_ignores_an_unrelated_skip(self):
+        # The rule keys on the pinned rows, not on any skip: a skip outside
+        # them must not trip it.
+        with self.overlay_present():
+            code, summary, _, _ = self.run_profile(
+                'kernel', ctest_rows=FULL_FLOOR['kernel'] + 1,
+                ctest_skipped=['test_native_live_websocket'])
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertNotIn('ctest-private-fixtures', failure_stages(summary))
+
+    def absent_run(self, profile, registered, pinned_skips, extra_skips=()):
+        """A real Driver run of the absent world with a scripted registry."""
+        with self.overlay_absent():
+            return self.run_profile(
+                profile, ctest_registered=registered, ctest_rows=registered,
+                ctest_skipped=list(pinned_skips) + list(extra_skips))
+
+    def full_registration(self, profile) -> int:
+        """The profile's overlay-present registered population (the table's `full`)."""
+        return FULL_FLOOR[profile]
+
+    def test_red_one_public_row_lost_from_the_registry_fails_the_absent_floor(self):
+        # Control (a) of R2-F1: the absent floor is a constant, so a run whose
+        # registry loses one public row fails even though `ctest -N` went down
+        # with it -- the old second term read the run's own registration and
+        # sank with it (on this head, release absent ran 603 against a floor of
+        # 602 with two of main's rows already gone).
+        for profile in ('kernel', 'release'):
+            registered = self.full_registration(profile)
+            pinned = self.pinned_probe(
+                ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS[profile][1])
+            with self.subTest(profile=profile, state='the full registration, every '
+                                                     'pinned row skipping'):
+                code, summary, _, _ = self.absent_run(profile, registered, pinned)
+                self.assertEqual(code, 0, summary['failures'])
+                self.assertEqual(summary['minTests'], ABSENT_FLOOR[profile])
+                self.assertEqual(summary['ctestRows'], ABSENT_FLOOR[profile])
+            with self.subTest(profile=profile, state='one public row left the registry'):
+                code, summary, _, _ = self.absent_run(profile, registered - 1, pinned)
+                self.assertEqual(code, 1)
+                self.assertIn('ctest-floor', failure_stages(summary))
+                self.assertEqual(summary['minTests'], ABSENT_FLOOR[profile])
+                self.assertEqual(summary['ctestRows'], ABSENT_FLOOR[profile] - 1)
+
+    def test_red_one_public_row_registered_but_not_run_fails_the_absent_floor(self):
+        # Control (b): an unpinned row that stops running is a loss with no
+        # margin to absorb it, even though CTest's own count still holds it.
+        for profile in ('kernel', 'release'):
+            pinned = self.pinned_probe(
+                ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS[profile][1])
+            registered = self.full_registration(profile)
+            with self.subTest(profile=profile):
+                code, summary, _, _ = self.absent_run(
+                    profile, registered, pinned, extra_skips=['test_one_public_row_lost'])
+                self.assertEqual(code, 1)
+                self.assertIn('ctest-floor', failure_stages(summary))
+                self.assertEqual(summary['ctestRows'], ABSENT_FLOOR[profile] - 1)
+                self.assertEqual(summary['minTests'], ABSENT_FLOOR[profile])
+                error = next(item['error'] for item in summary['failures']
+                             if item['stage'] == 'ctest-floor')
+                self.assertIn('test_one_public_row_lost', error)
+                self.assertIn('below the floor', error)
+
+    def test_green_all_pinned_rows_skip_and_everything_else_runs_passes(self):
+        # Control (c): the profile's real overlay-present registration, in the
+        # absent world, with exactly its pinned rows skipping -- the run the
+        # campaign's absent jobs are, and it passes AT the floor.
+        for profile in ('kernel', 'release'):
+            registered = self.full_registration(profile)
+            pinned = self.pinned_probe(
+                ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS[profile][1])
+            with self.subTest(profile=profile):
+                code, summary, _, build_dir = self.absent_run(profile, registered, pinned)
+                self.assertEqual(code, 0, summary['failures'])
+                self.assertEqual(summary['minTests'], ABSENT_FLOOR[profile])
+                self.assertEqual(summary['ctestRows'], ABSENT_FLOOR[profile])
+                log = (build_dir / 'ci-logs' / 'ctest-floor.log').read_text()
+                self.assertIn(f'lowered by {len(pinned)} pinned private-fixture '
+                              f'placeholder rows (full floor {FULL_FLOOR[profile]})', log)
+
+    def test_the_heads_real_absent_shapes_at_the_fixed_rule(self):
+        # Two absent-world shapes driven through the real Driver. The head's
+        # own kernel absent run (rj-20261012t003154-1c9988) registered 337 rows
+        # with its 28 pinned placeholders skipping: 309 ran, exactly the
+        # constant floor (337 - 28), so it passes. The shrunken registry the
+        # R2 review measured registered 901 with 298 pinned skips: 603 ran,
+        # below the 610 (910 - 300) the rule states, and the floor FAILS it --
+        # the two rows the twin guards drop (R2-F2) are not bought back by a
+        # registry that shrank with them. That is the RED the old observed-skip
+        # floor could not show (it passed 603 against 602).
+        code, summary, _, _ = self.absent_run('kernel', 337, self.pinned_probe(28))
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertEqual(summary['minTests'], ABSENT_FLOOR['kernel'])
+        self.assertEqual(summary['ctestRows'], ABSENT_FLOOR['kernel'])
+        code, summary, _, _ = self.absent_run('release', 901, self.pinned_probe(298))
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-floor', failure_stages(summary))
+        self.assertEqual(summary['minTests'], ABSENT_FLOOR['release'])
+        self.assertEqual(summary['ctestRows'], 603)
+
+    def test_min_tests_values_are_never_lowered(self):
+        # R2-F8: the lowering keys on the PROFILE, not on the floor's value, so
+        # an explicit --min-tests 325 is used verbatim in the absent world --
+        # where the profile's own floor is 309 -- and fails a 309-row run the
+        # default accepts. The replaced code lowered an explicit 325 by the
+        # observed skips (204) and passed it.
+        pinned = self.pinned_probe(28)
+        code, summary, _, _ = self.absent_run('kernel', 337, pinned)
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertEqual(summary['minTests'], ABSENT_FLOOR['kernel'])
+        with self.overlay_absent():
+            code, summary, _, _ = self.run_profile(
+                'kernel', extra=['--min-tests', '325'], ctest_registered=337,
+                ctest_rows=337, ctest_skipped=pinned)
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-floor', failure_stages(summary))
+        self.assertEqual(summary['minTests'], 325)
+        with self.overlay_absent():
+            code, summary, _, _ = self.run_profile(
+                'kernel', extra=['--min-tests', '309'], ctest_registered=337,
+                ctest_rows=337, ctest_skipped=pinned)
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertEqual(summary['minTests'], 309)
+
+    def test_the_lowered_note_prints_only_for_the_tables_own_lowering(self):
+        # N5: an explicit --min-tests that happens to equal full minus pinned
+        # was not lowered by the table; the note must not claim it was. The
+        # default floor keeps printing it.
+        pinned = self.pinned_probe(
+            ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['kernel'][1])
+        with self.overlay_absent():
+            code, summary, _, build_dir = self.run_profile(
+                'kernel', extra=['--min-tests', str(ABSENT_FLOOR['kernel'])],
+                ctest_registered=FULL_FLOOR['kernel'], ctest_rows=FULL_FLOOR['kernel'],
+                ctest_skipped=pinned)
+        self.assertEqual(code, 0, summary['failures'])
+        log = (build_dir / 'ci-logs' / 'ctest-floor.log').read_text()
+        self.assertNotIn('lowered by', log)
+        with self.overlay_absent():
+            code, summary, _, build_dir = self.run_profile(
+                'kernel', ctest_registered=FULL_FLOOR['kernel'],
+                ctest_rows=FULL_FLOOR['kernel'], ctest_skipped=pinned)
+        self.assertEqual(code, 0, summary['failures'])
+        log = (build_dir / 'ci-logs' / 'ctest-floor.log').read_text()
+        self.assertIn('lowered by', log)
+
+    def test_the_old_controls_shape_registered_at_the_floor_still_behaves(self):
+        # Control (e): the shape the replaced controls drove -- a run that
+        # registers exactly the floor -- behaves the same way under the
+        # constant: at the floor it passes, one row under it fails closed.
+        for profile in ('kernel', 'release'):
+            with self.subTest(profile=profile, state='at the floor'):
+                code, summary, _, _ = self.absent_run(
+                    profile, ABSENT_FLOOR[profile], ())
+                self.assertEqual(code, 0, summary['failures'])
+                self.assertEqual(summary['minTests'], ABSENT_FLOOR[profile])
+            with self.subTest(profile=profile, state='one under'):
+                code, summary, _, _ = self.absent_run(
+                    profile, ABSENT_FLOOR[profile], ('test_quietly_skipping',))
+                self.assertEqual(code, 1)
+                self.assertIn('ctest-floor', failure_stages(summary))
+                self.assertEqual(summary['ctestRows'], ABSENT_FLOOR[profile] - 1)
+
+    def test_red_overlay_present_any_skipped_row_fails_the_run(self):
+        # Control (d): with the overlay present the profile's whole population
+        # must run, so ANY row that skips is a lost row -- a pinned one on the
+        # label rule and on the floor, an unpinned one on the floor alone.
+        for skipped, stages in (
+                (['test_aapl15_margin_brackets_l4a'],
+                 ['ctest-private-fixtures', 'ctest-floor']),
+                (['test_native_live_websocket'], ['ctest-floor'])):
+            with self.subTest(skipped=skipped):
+                with self.overlay_present():
+                    code, summary, _, _ = self.run_profile(
+                        'kernel', ctest_rows=FULL_FLOOR['kernel'],
+                        ctest_skipped=skipped)
+                self.assertEqual(code, 1)
+                self.assertEqual(failure_stages(summary), stages)
+                self.assertEqual(summary['ctestRows'], FULL_FLOOR['kernel'] - 1)
+
+    def test_green_overlay_absent_the_profiles_own_population_passes(self):
+        # GREEN (flag unset): the profile's real overlay-present registration,
+        # in the absent world, with exactly its pinned rows skipping, meets the
+        # absent floor exactly.
+        pinned = self.pinned_probe(ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['release'][1])
+        with self.overlay_absent():
+            code, summary, _, _ = self.run_profile(
+                'release', ctest_registered=FULL_FLOOR['release'],
+                ctest_rows=FULL_FLOOR['release'], ctest_skipped=pinned)
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertEqual(summary['ctestRows'], ABSENT_FLOOR['release'])
+        self.assertEqual(summary['minTests'], ABSENT_FLOOR['release'])
+
+    def test_red_overlay_absent_one_row_below_the_floor_fails(self):
+        # RED (flag unset): one row under the constant floor fails closed, even
+        # though the run registered one row fewer -- the floor does not follow
+        # the registry down.
+        pinned = self.pinned_probe(ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['release'][1])
+        with self.overlay_absent():
+            code, summary, _, _ = self.run_profile(
+                'release', ctest_registered=FULL_FLOOR['release'] - 1,
+                ctest_rows=FULL_FLOOR['release'] - 1, ctest_skipped=pinned)
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-floor', failure_stages(summary))
+        self.assertEqual(summary['minTests'], ABSENT_FLOOR['release'])
+        error = next(item['error'] for item in summary['failures']
+                     if item['stage'] == 'ctest-floor')
+        self.assertIn(str(ABSENT_FLOOR['release']), error)
+
+    def test_red_absent_a_pinned_row_that_runs_fails_the_floor(self):
+        # N4: a pinned row that RAN without its fixtures is counted by the
+        # floor like any public row, so it hides the loss of one of them.
+        # Every registered pinned row must skip in the absent world.
+        pinned = self.pinned_probe(
+            ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['kernel'][1])
+        with self.overlay_absent():
+            code, summary, _, _ = self.run_profile(
+                'kernel', ctest_registered=FULL_FLOOR['kernel'],
+                ctest_rows=FULL_FLOOR['kernel'], ctest_skipped=pinned[:-1],
+                ctest_registered_names=pinned)
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-floor', failure_stages(summary))
+        error = next(item['error'] for item in summary['failures']
+                     if item['stage'] == 'ctest-floor')
+        self.assertIn('pinned rows that ran: 1', error)
+        self.assertIn(pinned[-1], error)
+        # 337 - 27 = 310 ran, one ABOVE the 309 floor: only this rule sees it.
+        self.assertEqual(summary['ctestRows'], ABSENT_FLOOR['kernel'] + 1)
+
+    def test_green_absent_every_registered_pinned_row_skips(self):
+        # N4 GREEN: the same registry with every pinned row skipping passes.
+        pinned = self.pinned_probe(
+            ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['kernel'][1])
+        with self.overlay_absent():
+            code, summary, _, _ = self.run_profile(
+                'kernel', ctest_registered=FULL_FLOOR['kernel'],
+                ctest_rows=FULL_FLOOR['kernel'], ctest_skipped=pinned,
+                ctest_registered_names=pinned)
+        self.assertEqual(code, 0, summary['failures'])
+
+    def test_red_absent_a_listing_without_row_names_fails_closed(self):
+        # The rule reads the run's own registry: a listing whose count parses
+        # but which carries no names cannot answer, and must fail closed.
+        pinned = self.pinned_probe(
+            ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['kernel'][1])
+        with self.overlay_absent():
+            code, summary, _, _ = self.run_profile(
+                'kernel', ctest_registered=FULL_FLOOR['kernel'],
+                ctest_rows=FULL_FLOOR['kernel'], ctest_skipped=pinned,
+                **{'ctest-list-all': 'names-less'})
+        self.assertEqual(code, 1)
+        error = next(item['error'] for item in summary['failures']
+                     if item['stage'] == 'ctest-floor')
+        self.assertIn('carried no row names', error)
+
+    def test_green_absent_the_named_websocket_skip_does_not_trip_the_floor(self):
+        # N6: main's kernel floor counted test_native_live_websocket's 77 as a
+        # run (its number sat one below the registered count). The table's full
+        # floor counts that row as running, so the one named row keeps the
+        # allowance: 337 registered, 28 pinned + 1 websocket skipping, 308 ran.
+        pinned = self.pinned_probe(
+            ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['kernel'][1])
+        with self.overlay_absent():
+            code, summary, _, build_dir = self.run_profile(
+                'kernel', ctest_registered=FULL_FLOOR['kernel'],
+                ctest_rows=FULL_FLOOR['kernel'],
+                ctest_skipped=pinned + [ci_verify.WEBSOCKET_SKIP_ROW])
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertEqual(summary['ctestRows'], ABSENT_FLOOR['kernel'] - 1)
+        log = (build_dir / 'ci-logs' / 'ctest-floor.log').read_text()
+        self.assertIn('allowed as on main', log)
+        self.assertIn(ci_verify.WEBSOCKET_SKIP_ROW, log)
+
+    def test_red_absent_any_other_unpinned_skip_still_fails(self):
+        # N6: the allowance is exactly ONE named row; any other unpinned skip
+        # is still a loss with no margin to absorb it.
+        pinned = self.pinned_probe(
+            ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['kernel'][1])
+        with self.overlay_absent():
+            code, summary, _, _ = self.run_profile(
+                'kernel', ctest_registered=FULL_FLOOR['kernel'],
+                ctest_rows=FULL_FLOOR['kernel'],
+                ctest_skipped=pinned + ['test_another_unpinned_row'])
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-floor', failure_stages(summary))
+        error = next(item['error'] for item in summary['failures']
+                     if item['stage'] == 'ctest-floor')
+        self.assertIn('below the floor', error)
+
+    def test_red_overlay_absent_an_unpinned_skip_is_a_loss(self):
+        # RED (flag unset): a row that skips without being pinned is a loss --
+        # there is no margin to absorb it, because the floor is a constant.
+        pinned = self.pinned_probe(ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['release'][1])
+        with self.overlay_absent():
+            code, summary, _, _ = self.run_profile(
+                'release', ctest_registered=FULL_FLOOR['release'],
+                ctest_rows=FULL_FLOOR['release'],
+                ctest_skipped=pinned + ['test_quietly_skipping'])
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-floor', failure_stages(summary))
+        self.assertEqual(summary['ctestRows'], ABSENT_FLOOR['release'] - 1)
+        self.assertEqual(summary['minTests'], ABSENT_FLOOR['release'])
+
+
+class PrExclusionWithFixturesAbsent(unittest.TestCase):
+    """N1: the --exclude-label branch in the public PR jobs (fixtures absent).
+
+    The PR Debug and sanitizers jobs run `ctest -LE slow` on a tree without
+    the private fixtures: the pinned placeholders are still selected and
+    SKIP, and the old rule (ran == selected) failed on every one of them --
+    D2's probe of the real Driver (debug, 882 registered, 5 slow, 290 pinned
+    skipping) exited 1 with 'CTest registered 882, labelled 5, selected 877,
+    but ran 587'. The branch now accepts exactly the pinned skips: every
+    skipped row must be pinned and ran + pinned skips must equal selected,
+    so an unpinned skip and a lost public row both still fail.
+    """
+
+    def run_profile(self, profile='debug', extra=None, **exits):
+        exits.setdefault('source-guard-native-versions', 0)
+        return DriverOrderingAndAggregation.run_profile(
+            self, profile, extra=['--exclude-label', 'slow'] + list(extra or []), **exits)
+
+    def pinned_probe(self, count: int) -> list:
+        return sorted(ci_verify.private_fixture_rows(ROOT))[:count]
+
+    def test_green_the_d2_probe_shape_passes(self):
+        # Control (a): the PR shape's own numbers. RED before the fix: exit 1,
+        # 'but ran 587; not counted: 290 skipped'.
+        code, summary, _, build_dir = self.run_profile(
+            'debug', ctest_registered=882, ctest_labelled=5, ctest_rows=877,
+            ctest_skipped=self.pinned_probe(290))
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertIn('ctest-exclusion', stage_names(summary))
+        self.assertEqual(summary['ctestRows'], 877 - 290)
+        log = (build_dir / 'ci-logs' / 'ctest-exclusion.log').read_text()
+        self.assertIn('587', log)
+        self.assertIn('290 pinned private-fixture rows skipping', log)
+
+    def test_red_an_unpinned_skip_fails(self):
+        # Control (b): one skipped row outside the pin is a failure even
+        # though the arithmetic alone would tolerate it.
+        code, summary, _, _ = self.run_profile(
+            'debug', ctest_registered=882, ctest_labelled=5, ctest_rows=877,
+            ctest_skipped=self.pinned_probe(290) + ['test_row_not_pinned'])
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-exclusion', failure_stages(summary))
+        error = next(item['error'] for item in summary['failures']
+                     if item['stage'] == 'ctest-exclusion')
+        self.assertIn('test_row_not_pinned', error)
+        self.assertIn('skipped but not pinned', error)
+
+    def test_red_a_lost_public_row_fails(self):
+        # Control (c): one public row fewer ran than the selection holds:
+        # ran + pinned skips < selected.
+        code, summary, _, _ = self.run_profile(
+            'debug', ctest_registered=882, ctest_labelled=5, ctest_rows=876,
+            ctest_skipped=self.pinned_probe(290))
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-exclusion', failure_stages(summary))
+        error = next(item['error'] for item in summary['failures']
+                     if item['stage'] == 'ctest-exclusion')
+        self.assertIn('586', error)
+        self.assertIn('selected 877', error)
+
+    def test_red_overlay_present_a_pinned_skip_fails_the_exclusion(self):
+        # Control (d): with the overlay present the old rule stands -- every
+        # selected row must run -- so even a pinned row that skips fails, on
+        # the private-fixtures rule and on the exclusion stage.
+        with mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': '1'}):
+            code, summary, _, _ = self.run_profile(
+                'debug', ctest_registered=882, ctest_labelled=5, ctest_rows=877,
+                ctest_skipped=self.pinned_probe(1))
+        self.assertEqual(code, 1)
+        self.assertIn('ctest-exclusion', failure_stages(summary))
+        self.assertIn('ctest-private-fixtures', failure_stages(summary))
+
+    def test_red_overlay_present_an_unpinned_skip_fails_the_exclusion(self):
+        # Control (d) again: an unpinned skip is refused too while the
+        # overlay is present (only the exclusion stage catches it).
+        with mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': '1'}):
+            code, summary, _, _ = self.run_profile(
+                'debug', ctest_registered=882, ctest_labelled=5, ctest_rows=877,
+                ctest_skipped=['test_native_live_websocket'])
+        self.assertEqual(code, 1)
+        self.assertEqual(failure_stages(summary), ['ctest-exclusion'])
+
+    def test_green_the_floor_path_is_unchanged_without_the_flag(self):
+        # Control (e): the release shape (no --exclude-label) never enters the
+        # exclusion stage; the constant floor still governs it.
+        pinned = self.pinned_probe(ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['release'][1])
+        code, summary, _, _ = DriverOrderingAndAggregation.run_profile(
+            self, 'release', ctest_registered=ABSENT_FLOOR['release'],
+            ctest_rows=FULL_FLOOR['release'], ctest_skipped=pinned)
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertIn('ctest-floor', stage_names(summary))
+        self.assertNotIn('ctest-exclusion', stage_names(summary))
+
+    def test_red_an_unreadable_pin_fails_the_exclusion_closed(self):
+        # The pin file speaks only while it carries PRIVATE_FIXTURE_ROW_COUNT
+        # names: a truncated pin cannot clear the skips it lost.
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / 'tests').mkdir()
+            (source / 'VERSION').write_text('0.0.0\n')
+            rows = (ROOT / 'tests' / 'private_fixture_rows.txt').read_text().splitlines()
+            (source / 'tests' / 'private_fixture_rows.txt').write_text(
+                '\n'.join(rows[:len(rows) // 2]) + '\n')
+            cfg = ci_verify.build_config(
+                ['debug', '--exclude-label', 'slow', '--build-dir', str(source / 'build')],
+                source=source, runner=default_runner, stream_output=False)
+            driver = ci_verify.Driver(cfg)
+            driver.enforce_test_floor(
+                Completed(0, ctest_output(877, tuple(self.pinned_probe(2))), b''),
+                registered=882, selected=877)
+        self.assertEqual([stage['status'] for stage in driver.stages], ['failed'])
+        self.assertIn('a truncated pin cannot clear the rows it lost',
+                      driver.stages[0]['error'])
+        self.assertEqual(driver.stages[0]['name'], 'ctest-exclusion')
+
+
+class LiveProfilesWithFixturesAbsent(unittest.TestCase):
+    """X2: the required native-live job on a tree without the private fixtures.
+
+    live-sanitizers and live-tsan run ONLY the runner/ rows and refuse every
+    skip; without the overlay runner/ registers its pinned private-fixture
+    placeholders and they SKIP, so the old rule failed the required
+    native-live job of every public PR (.github/workflows/ci.yml's build
+    gate). The branch now accepts exactly the pinned skips -- every skipped
+    row must be a pinned private-fixture row -- while an unpinned skip, a
+    not-run row and a disabled row still fail, and with the overlay present
+    the old rule stands: nothing may skip.
+    """
+
+    def run_profile(self, profile='live-sanitizers', extra=None, **exits):
+        # The real source guards run in this harness, and this tree has no
+        # private fixtures: check_native_cpp_versions genuinely exits 77 in
+        # BOTH worlds, accepted while the overlay is absent and refused under
+        # it (R2-F3). These controls are about the runner-skip rule, so that
+        # one guard is scripted as the world leaves it, as the sibling
+        # control classes do.
+        exits.setdefault('source-guard-native-versions', 0)
+        return DriverOrderingAndAggregation.run_profile(
+            self, profile, extra=extra, **exits)
+
+    def pinned_probe(self, count: int) -> list:
+        pinned = sorted(ci_verify.private_fixture_rows(ROOT))
+        self.assertGreaterEqual(len(pinned), count)
+        return pinned[:count]
+
+    def test_green_the_absent_runner_placeholders_skip_and_the_profile_passes(self):
+        # Control (a): the public native-live shape. The runner/ tree
+        # registers its 65 pinned placeholders beside the 12 rows it runs;
+        # they skip, ran stays at the floor, and the profile passes with the
+        # acceptance printed.
+        pinned = self.pinned_probe(65)
+        code, summary, _, build_dir = self.run_profile(
+            'live-sanitizers', ctest_registered=77, ctest_rows=77,
+            ctest_skipped=pinned)
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertEqual(summary['ctestRows'], LIVE_SANITIZERS_MIN_TESTS)
+        self.assertNotIn('live-test-skips', failure_stages(summary))
+        self.assertIn('live-test-skips', stage_names(summary))
+        log = (build_dir / 'ci-logs' / 'live-test-skips.log').read_text()
+        self.assertIn('65 pinned private-fixture rows skipping', log)
+
+    def test_red_an_unpinned_runner_skip_fails(self):
+        # Control (b): one skipped row outside the pin is a failure, even
+        # though the arithmetic alone would tolerate it.
+        pinned = self.pinned_probe(65)
+        code, summary, _, _ = self.run_profile(
+            'live-sanitizers', ctest_registered=78, ctest_rows=78,
+            ctest_skipped=pinned + ['test_unpinned_runner_row'])
+        self.assertEqual(code, 1)
+        self.assertIn('live-test-skips', failure_stages(summary))
+        error = next(item['error'] for item in summary['failures']
+                     if item['stage'] == 'live-test-skips')
+        self.assertIn('test_unpinned_runner_row', error)
+        self.assertIn('not pinned private-fixture placeholders', error)
+
+    def test_red_a_not_run_row_fails_with_the_pinned_skips(self):
+        # Control (c): a row CTest could not start is refused beside the
+        # pinned skips -- the acceptance covers skips, nothing else.
+        pinned = self.pinned_probe(65)
+        code, summary, _, _ = self.run_profile(
+            'live-sanitizers', ctest_registered=78, ctest_rows=78,
+            ctest_skipped=pinned, ctest_not_run=['test_live_not_run_row'])
+        self.assertEqual(code, 1)
+        self.assertIn('live-test-skips', failure_stages(summary))
+        error = next(item['error'] for item in summary['failures']
+                     if item['stage'] == 'live-test-skips')
+        self.assertIn('cannot accept skipped, disabled or unreadable rows', error)
+
+    def test_red_a_disabled_row_fails_with_the_pinned_skips(self):
+        # Control (c) again, for the disabled list: CTest leaves it out of its
+        # own count, so only this rule can refuse it.
+        pinned = self.pinned_probe(65)
+        code, summary, _, _ = self.run_profile(
+            'live-sanitizers', ctest_registered=77, ctest_rows=77,
+            ctest_skipped=pinned, ctest_disabled=['test_live_disabled_row'])
+        self.assertEqual(code, 1)
+        self.assertIn('live-test-skips', failure_stages(summary))
+
+    def test_red_overlay_present_a_pinned_skip_still_fails(self):
+        # Control (d): with the overlay present the old rule stands -- every
+        # runner row must run -- so a pinned row that skips fails on the
+        # private-fixtures rule and on this one.
+        with mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': '1'}):
+            code, summary, _, _ = self.run_profile(
+                'live-sanitizers', ctest_registered=13, ctest_rows=13,
+                ctest_skipped=self.pinned_probe(1))
+        self.assertEqual(code, 1)
+        self.assertIn('live-test-skips', failure_stages(summary))
+        self.assertIn('ctest-private-fixtures', failure_stages(summary))
+        error = next(item['error'] for item in summary['failures']
+                     if item['stage'] == 'live-test-skips')
+        self.assertIn('cannot accept skipped', error)
+
+    def test_green_live_tsan_carries_the_same_rule(self):
+        # The rule keys on the profile SET: live-tsan accepts the pinned
+        # placeholders the same way.
+        pinned = self.pinned_probe(65)
+        code, summary, _, _ = self.run_profile(
+            'live-tsan', ctest_registered=77, ctest_rows=77,
+            ctest_skipped=pinned)
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertIn('live-test-skips', stage_names(summary))
+
+    def test_the_native_profile_is_not_under_this_rule(self):
+        # Control (e): the native profile runs runner rows too but is not a
+        # live-only profile; its shape is unchanged -- the runner-skip rule
+        # adds no stage there (and with the overlay absent its own rules are
+        # the floor's, which this profile declares none of).
+        pinned = self.pinned_probe(1)
+        code, summary, _, _ = self.run_profile(
+            'native', ctest_registered=963, ctest_rows=963,
+            ctest_skipped=pinned)
+        self.assertEqual(code, 0, summary['failures'])
+        self.assertNotIn('live-test-skips', stage_names(summary))
+        self.assertNotIn('ctest-floor', stage_names(summary))
+
+
+class FloorDocsPointAtTheTable(unittest.TestCase):
+    """N3: the floors have ONE source, and the prose says where it is.
+
+    KERNEL_MIN_TESTS / RELEASE_MIN_TESTS were a dead second copy: the
+    --min-tests help quoted 325 and 895 (false), and six doc places told
+    contributors to raise the constants. The two names are now plain
+    module-level integer literals that the table references (the campaign's
+    proof kit reads each one from the tree as a single line), and this
+    control fails when the help text or a doc place goes back to a number of
+    its own, or when the literals and the table move apart.
+    """
+
+    STALE_INSTRUCTIONS = (
+        'raise the floor in the same commit',
+        'Raise the constant when a row lands',
+        'Adding rows means raising the floor',
+        'raise the floor',
+    )
+    DOC_PLACES = ('CONTRIBUTING.md', 'docs/pages/contributing-llm.md',
+                  'docs/pages/native-engine.md', 'docs/ci.md',
+                  '.github/workflows/ci.yml')
+
+    def test_the_two_names_are_literals_the_table_references(self):
+        # AST teeth, in the direction the tree now fixes: the right-hand sides
+        # must be plain integer literals (CORE's proof kit reads each from the
+        # tree as one line), and the table's `full` entries must reference the
+        # NAMES -- writing a number into the table, or deriving a name from it,
+        # fails here.
+        module = ast.parse((ROOT / 'scripts' / 'ci_verify.py').read_text())
+        assigned, table = {}, None
+        for node in module.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if not isinstance(target, ast.Name):
+                    continue
+                if target.id in ('KERNEL_MIN_TESTS', 'RELEASE_MIN_TESTS'):
+                    assigned[target.id] = node.value
+                elif target.id == 'PRIVATE_FIXTURE_PROFILE_FLOORS':
+                    table = node.value
+        self.assertEqual(set(assigned), {'KERNEL_MIN_TESTS', 'RELEASE_MIN_TESTS'})
+        for name, value in assigned.items():
+            with self.subTest(name=name):
+                self.assertIsInstance(value, ast.Constant)
+                self.assertIsInstance(value.value, int)
+        self.assertIsInstance(table, ast.Dict)
+        entries = {}
+        for key, value in zip(table.keys, table.values):
+            self.assertIsInstance(key, ast.Constant)
+            self.assertIsInstance(value, ast.Tuple)
+            entries[key.value] = value.elts[0]
+        self.assertEqual(set(entries), {'release', 'kernel'})
+        self.assertEqual(sorted(node.id for node in entries.values()),
+                         ['KERNEL_MIN_TESTS', 'RELEASE_MIN_TESTS'])
+        self.assertEqual(ci_verify.KERNEL_MIN_TESTS,
+                         ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['kernel'][0])
+        self.assertEqual(ci_verify.RELEASE_MIN_TESTS,
+                         ci_verify.PRIVATE_FIXTURE_PROFILE_FLOORS['release'][0])
+
+    def test_the_help_text_names_the_table_and_no_stale_number(self):
+        result = subprocess.run(
+            [sys.executable, '-B', str(ROOT / 'scripts' / 'ci_verify.py'), '--help'],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('PRIVATE_FIXTURE_PROFILE_FLOORS', result.stdout)
+        self.assertNotIn('defaults to 325', result.stdout)
+        self.assertNotIn('895', result.stdout)
+
+    def test_every_doc_place_points_at_the_table(self):
+        for rel in self.DOC_PLACES:
+            text = (ROOT / rel).read_text()
+            with self.subTest(place=rel):
+                self.assertIn('PRIVATE_FIXTURE_PROFILE_FLOORS', text)
+                for stale in self.STALE_INSTRUCTIONS:
+                    self.assertNotIn(stale, text)
+        for rel in ('docs/pages/contributing-llm.md', 'docs/pages/native-engine.md',
+                    'CONTRIBUTING.md', '.github/workflows/ci.yml'):
+            with self.subTest(place=rel):
+                text = (ROOT / rel).read_text()
+                self.assertNotIn('KERNEL_MIN_TESTS', text)
+                self.assertNotIn('RELEASE_MIN_TESTS', text)
 
 
 class ExamplesAssertLive(unittest.TestCase):

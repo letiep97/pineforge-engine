@@ -11,12 +11,15 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import check_abi_receipt_skips as skips
 from ci_verify import ctest_rows
@@ -28,6 +31,30 @@ CTEST = shutil.which('ctest')
 CHECKER = ('import sys, os; a = sys.argv[1:]; '
            'sys.exit(77 if any(f.endswith("-receipt") and f != "--receipt" '
            'and not os.path.exists(v) for f, v in zip(a, a[1:])) else 0)')
+
+_SENTINEL = object()
+_PRIOR_OVERLAY_FLAG: object = _SENTINEL
+
+
+def setUpModule():
+    # The module describes the tree it runs on: the fixture-absent public
+    # world, the one the preparer's pinned SKIP literal belongs to. Lab's
+    # overlay job exports PINEFORGE_PRIVATE_FIXTURES into the inherited
+    # environment, and the preparer reads it live, so the absent-world shapes
+    # below (the four pinned placeholder rows; the prepare over a tree whose
+    # manifests are gone) would be judged in the wrong world and refused. The
+    # test that IS about the overlay sets the flag itself
+    # (test_the_overlay_refuses_the_preparer_skip) and the world is restored
+    # for whatever ran the suite.
+    global _PRIOR_OVERLAY_FLAG
+    _PRIOR_OVERLAY_FLAG = os.environ.get('PINEFORGE_PRIVATE_FIXTURES', _SENTINEL)
+    os.environ.pop('PINEFORGE_PRIVATE_FIXTURES', None)
+
+
+def tearDownModule():
+    global _PRIOR_OVERLAY_FLAG
+    if _PRIOR_OVERLAY_FLAG is not _SENTINEL:
+        os.environ['PINEFORGE_PRIVATE_FIXTURES'] = str(_PRIOR_OVERLAY_FLAG)
 
 
 def cmake_quote(value: str) -> str:
@@ -227,6 +254,173 @@ class CTestSummarySpelling(unittest.TestCase):
                 self.assertEqual((rows.total, rows.ran), (4, 1))
                 self.assertEqual(rows.skipped, AgainstRealCTest.GATED)
                 self.assertEqual((rows.not_run, rows.disabled), ((), ()))
+
+
+class PrivateFixtureManifests(unittest.TestCase):
+    """The four receipt-gated rows in both private-fixture states (Item C).
+
+    The private-fixture PRs take the seven provider manifests out of the tree,
+    where the preparer answers the pinned SKIP literal and exit 77 and
+    tests/CMakeLists.txt registers each receipt-gated row as the pinned SKIP
+    placeholder instead of a row that would fail its missing receipt. Both
+    states are built here as the rows `ctest --show-only=json-v1` prints (this
+    suite's rows are hand-written, no ctest run), and the sweep at the end
+    reads the real tests/CMakeLists.txt to prove each row's guard names the
+    manifests of the receipts it reads.
+    """
+
+    ROWS = ('test_script_cpp_abi', 'test_settlement_cpp_abi',
+            'test_aggregate_cpp_versions_runtime', 'test_l4g_runtime_budget')
+    # The provider each --<stem>-receipt flag names, in the flag order
+    # tests/CMakeLists.txt gives each row.
+    ROW_PROVIDERS = {
+        'test_script_cpp_abi': ('v18-frozen',),
+        'test_settlement_cpp_abi': ('e60', '0e', 'v13', 'v14', 'v15-frozen',
+                                    'v16-frozen', 'v18-frozen'),
+        'test_aggregate_cpp_versions_runtime': ('v18-frozen',),
+        'test_l4g_runtime_budget': ('v16-frozen',),
+    }
+
+    def manifest(self, role):
+        return str(PROVIDERS[role]['manifest'].relative_to(skips.ROOT))
+
+    def placeholder(self, role):
+        """The row dict the pinned SKIP placeholder registers for a provider."""
+        manifest = self.manifest(role)
+        return ['cmake', '-E', 'echo', 'SKIP private fixtures not present: ' + manifest]
+
+    def gated(self, role, build, *, mode='--require-receipts'):
+        """The row dict the real registration gives provider `role`."""
+        stem = {'e60': 'base', '0e': 'prior'}.get(role, role)
+        return [sys.executable, 'check.py', f'--{stem}-receipt',
+                str(build / PROVIDERS[role]['default_output'] / 'receipt.json'), mode]
+
+    def test_absent_manifests_make_the_four_rows_pinned_skips_not_failures(self):
+        # Every manifest the tree would need is absent: each of the four rows
+        # is its pinned SKIP placeholder, so the checker sees no receipt-gated
+        # row at all -- none counted a failure, exit 0 -- while the placeholder
+        # output is exactly the pinned literal naming the missing manifest.
+        # The scenario is an absent-world one by construction (the overlay is
+        # what puts the manifests in the tree), so it says so: no
+        # PINEFORGE_PRIVATE_FIXTURES, whatever the suite inherited. The overlay
+        # answer to the same literal is the test below it.
+        with mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': ''}):
+            tests = [{'name': row, 'command': self.placeholder(
+                self.ROW_PROVIDERS[row][0])} for row in self.ROWS]
+            rows = skips.gated_rows(tests)
+            self.assertEqual(rows, [])
+            with tempfile.TemporaryDirectory() as temporary:
+                code, out = self.report(rows, Path(temporary))
+            self.assertEqual(code, 0, out)
+            self.assertIn('registers no receipt-gated CTest row', out)
+            for row in self.ROWS:
+                placeholder = tests[self.ROWS.index(row)]['command']
+                self.assertIn('SKIP private fixtures not present: ' + self.manifest(
+                    self.ROW_PROVIDERS[row][0]), ' '.join(placeholder))
+            # And the whole pipeline: --prepare over a tree whose manifests are
+            # gone reports each provider skipped (exit 77), not failed.
+            literal = 'SKIP private fixtures not present: ' + self.manifest('v18-frozen')
+            with tempfile.TemporaryDirectory() as temporary:
+                ok, out = self.prepare_with(Path(temporary), returncode=77, stdout=literal)
+            self.assertTrue(ok, out)
+            for role in skips.PROVIDER_ROLES:
+                self.assertIn(f'  {role}: skipped (exit 77): {literal}', out)
+            self.assertNotIn('refused', out)
+
+    def test_present_manifests_leave_all_four_rows_running(self):
+        # Every manifest and every provider receipt present: the four rows are
+        # receipt-gated exactly as before and every one runs -- exit 0, four
+        # rows named, none skipped or failed.
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            for role in PROVIDERS:
+                receipt = build / PROVIDERS[role]['default_output'] / 'receipt.json'
+                receipt.parent.mkdir(parents=True, exist_ok=True)
+                receipt.write_text('{}\n')
+            tests = [{'name': row,
+                      'command': [flag
+                                  for role in self.ROW_PROVIDERS[row]
+                                  for flag in self.gated(role, build)]}
+                     for row in self.ROWS]
+            rows = skips.gated_rows(tests)
+            self.assertEqual([row.name for row in rows], list(self.ROWS))
+            self.assertEqual([row.verdict for row in rows], ['runs'] * 4)
+            code, out = self.report(rows, build)
+        self.assertEqual(code, 0, out)
+        self.assertIn('every receipt they read is present: all 4 run', out)
+
+    def test_a_bare_77_from_the_preparer_is_still_a_failure(self):
+        # The skip is bought by the literal, never by the exit code alone.
+        with tempfile.TemporaryDirectory() as temporary:
+            ok, out = self.prepare_with(Path(temporary), returncode=77, stdout='')
+        self.assertFalse(ok, out)
+        self.assertNotIn('skipped (exit 77)', out)
+
+    def test_the_overlay_refuses_the_preparer_skip(self):
+        # N7: with PINEFORGE_PRIVATE_FIXTURES set the overlay is in the tree,
+        # so the preparer's absent-manifest answer is a failure even though it
+        # carries the literal -- RED on the pre-fix code, which accepted it.
+        literal = 'SKIP private fixtures not present: ' + self.manifest('v18-frozen')
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            with mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': '1'}):
+                ok, out = self.prepare_with(build, returncode=77, stdout=literal)
+        self.assertFalse(ok, out)
+        self.assertIn('refused: exit 77', out)
+        self.assertIn('the overlay did not reach this provider', out)
+        self.assertNotIn('skipped (exit 77)', out)
+        # The same shape without the overlay stays the absent world's skip.
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(os.environ, {'PINEFORGE_PRIVATE_FIXTURES': ''}):
+                ok, out = self.prepare_with(Path(temporary), returncode=77, stdout=literal)
+        self.assertTrue(ok, out)
+        self.assertIn('skipped (exit 77)', out)
+
+    def prepare_with(self, build, *, returncode, stdout):
+        def run(argv, **kwargs):
+            if 'cat-file' in argv:
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            return subprocess.CompletedProcess(argv, returncode, stdout, '')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = skips.prepare(skips.ROOT, build, 2, run=run)
+        return ok, out.getvalue()
+
+    def report(self, rows, build):
+        """check_abi_receipt_skips' own verdict for hand-written rows (no ctest)."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = skips.report(rows, build, str(build))
+        return code, out.getvalue()
+
+    def test_the_four_guards_name_the_manifests_of_the_receipts_they_read(self):
+        # The preparer/row agreement, swept over the real tests/CMakeLists.txt:
+        # for every --<stem>-receipt flag a row carries, the manifest that
+        # gates the row's registration must be the manifest its provider
+        # gates on. The pairs found are named in the count below.
+        text = (skips.ROOT / 'tests' / 'CMakeLists.txt').read_text()
+        bindings = dict(re.findall(r'set\((_pf_manifest_\S+)\s+\$\{PROJECT_SOURCE_DIR\}/(\S+)\)',
+                                   text))
+        self.assertTrue(bindings, 'the manifest bindings must be readable')
+        pairs = 0
+        for row in self.ROWS:
+            start = text.index('NAME ' + row)
+            guard = text.rindex('if(EXISTS', 0, start)
+            guarded = {bindings[name] for name in re.findall(
+                r'EXISTS \$\{(_pf_manifest_\w+)\}', text[guard:start])}
+            block = text[start:text.index('set_tests_properties(' + row, start)]
+            wanted = {self.manifest(role) for role in self.ROW_PROVIDERS[row]}
+            with self.subTest(row=row):
+                self.assertEqual(guarded, wanted)
+            pairs += len(wanted)
+            placeholder = re.search(
+                r'NAME ' + row + r' COMMAND \$\{CMAKE_COMMAND\} -E echo '
+                r'"SKIP private fixtures not present: (\S+)"', text)
+            self.assertIsNotNone(placeholder, row)
+            self.assertEqual(placeholder.group(1), self.manifest(self.ROW_PROVIDERS[row][0]))
+            self.assertTrue(set(re.findall(r'--([a-z0-9-]+)-receipt', block))
+                            <= {'base', 'prior', *PROVIDERS}, row)
+        self.assertEqual(pairs, 10)
 
 
 class Preparation(unittest.TestCase):
