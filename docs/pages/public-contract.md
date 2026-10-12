@@ -30,7 +30,16 @@ It adds two runtime failure getters and the feature probe
 resolution/failure fields. The repository's
 [CHANGELOG.md](../../CHANGELOG.md#140--2026-10-08), under
 *1.4.0 — 2026-10-08*, inventories the state-hash additions and report migration.
-Use the same-version 1.4.0 pair, with regeneration and relinking as below.
+
+1.5.0 followed on 2026-10-12: engine v1.5.0 with pineforge-codegen 1.5.0.
+It adds recorded outputs — doubles in named per-bar slots, run-level doubles
+and events, through the nine `pf_outputs` runtime exports of
+`<pineforge/pineforge.h>`, recorded only when a caller turns them on — and
+gives each run's report to the call that began it. The repository's
+[CHANGELOG.md](../../CHANGELOG.md#150--2026-10-12), under
+*1.5.0 — 2026-10-12*, inventories both and the test inputs' move to a
+private repository.
+Use the same-version 1.5.0 pair, with regeneration and relinking as below.
 
 ## Versions
 
@@ -135,6 +144,7 @@ the arguments #strategy_get_last_error_args answers (@ref run_failure_codes).
 The native C++ API is the kernel's host surface: `<pineforge/native_host.hpp>`,
 `<pineforge/native_run_spec.hpp>`, `<pineforge/native_fx_curve.hpp>`,
 `<pineforge/native_order.hpp>`, `<pineforge/native_calendar.hpp>`,
+`<pineforge/native_calc_point.hpp>` (new in 1.5.0),
 `<pineforge/market_driver.hpp>`, `<pineforge/order_action.hpp>`,
 `<pineforge/execution.hpp>`, the header-only `<pineforge/native_toolkit.hpp>`
 and `<pineforge/native_module.hpp>` (@ref native_engine).
