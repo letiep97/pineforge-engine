@@ -11,7 +11,10 @@
 #include "pine_host_reads.hpp"
 #include "pine_intent_state.hpp"
 #include "pine_quiet_bar.hpp"
+#include "pine_value_admit_doors.hpp"
 #include "pine_run_failure.hpp"
+#include "pine_value_admit_decl.hpp"
+#include "pine_value_admit_risk.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -191,6 +194,13 @@ double source::PineStrategyHost::margin_liquidation_price() const {
 
 PineStrategyConfig source::PineStrategyHost::apply_overrides(
         PineStrategyConfig config, const StrategyOverrides& overrides) {
+    if (std::isinf(overrides.default_qty_value)) {
+        throw coded<std::invalid_argument>(
+            RunFailureCode::setting_rejected,
+            {{"entrypoint", "strategy_set_override"},
+             {"reason", "number_out_of_finite_range"}},
+            "default_qty_value: number out of finite range");
+    }
     if (!std::isnan(overrides.initial_capital)) config.initial_capital = overrides.initial_capital;
     if (!std::isnan(overrides.commission_value)) config.commission_value = overrides.commission_value;
     if (!std::isnan(overrides.default_qty_value)) config.default_qty_value = overrides.default_qty_value;
@@ -843,6 +853,7 @@ NativePrecommitVerdict source::PineStrategyHost::validate_execution_precommit(
 
 void source::PineStrategyHost::configure_pine_strategy(const PineStrategyConfig& config) {
     guard_native_mutation("configure_pine_strategy");
+    admit_strategy_declaration(config);
     config_ = config;
     adapter_.set_configuration(config_);
     scheduler_.set_source_series_active(config_.src_series_active);
@@ -865,6 +876,8 @@ void source::PineStrategyHost::set_syminfo_session(const std::string& session) {
 // The six risk setters apply live as they always did. While a selected window's
 // pre-roll evaluation captures they also append an ordered row, so the replay
 // can set them again in the script's own order against the saved configuration.
+// The three int arguments cannot represent NaN/infinity; their existing
+// direction/count/cap behavior needs no numeric admission.
 void source::PineStrategyHost::set_pine_risk_direction(int direction) {
     detail::capture_risk_row(*this, config_, detail::IntentRiskDirection{direction});
     adapter_.set_risk_direction(direction);
@@ -876,11 +889,13 @@ void source::PineStrategyHost::set_pine_risk_max_cons_loss_days(int value) {
 }
 
 void source::PineStrategyHost::set_pine_risk_max_drawdown(double value, bool percent) {
+    admit_pine_risk_max_drawdown(value, percent);
     detail::capture_risk_row(*this, config_, detail::IntentRiskMaxDrawdown{value, percent});
     adapter_.set_risk_max_drawdown(value, percent);
 }
 
 void source::PineStrategyHost::set_pine_risk_max_intraday_loss(double value, bool percent) {
+    admit_pine_risk_max_intraday_loss(value, percent);
     detail::capture_risk_row(*this, config_, detail::IntentRiskMaxIntradayLoss{value, percent});
     adapter_.set_risk_max_intraday_loss(value, percent);
 }
@@ -892,6 +907,7 @@ void source::PineStrategyHost::set_pine_risk_max_intraday_filled_orders(int limi
 }
 
 void source::PineStrategyHost::set_pine_risk_max_position_size(double value) {
+    admit_pine_risk_max_position_size(value);
     detail::capture_risk_row(*this, config_, detail::IntentRiskMaxPositionSize{value});
     adapter_.set_risk_max_position_size(value);
 }
@@ -1946,6 +1962,11 @@ void source::PineStrategyHost::present_report(ReportC* out) const {
         context.account_fx = fx;
         const auto mark = build_close_trade_with_costs(lot, row.qty, price, row.is_long != 0,
             allocated_entry_commission(lot, row.qty), calc_commission_at(price, row.qty, fx), context);
+        // settlement safety guard (an invariant), not Pine parity. The price
+        // test is implied by the predicate (the mark carries it as exit_price);
+        // no mutant can kill it alone.
+        if (!internal::closed_row_all_finite(mark) || !std::isfinite(price))
+            throw std::logic_error("non-finite terminal-quote report row");
         row.exit_time = report_quote_time_ms_;
         row.exit_price = price;
         row.pnl = mark.pnl;
@@ -2126,6 +2147,12 @@ void source::PineStrategyHost::order_global_exit_children(
             rows.push_back(std::move(row));
             sources.push_back(first + slice.lot);
         }
+    }
+    // settlement safety guard (an invariant), not Pine parity. Validate all
+    // replacements before changing the committed rows or their tallies.
+    for (const auto& row : rows) {
+        if (!internal::closed_row_all_finite(row))
+            throw std::logic_error("non-finite amended trade row");
     }
     // strategy.wintrades / losstrades / eventrades and the gross sums count
     // rows: count the children's instead of the kernel's. net_profit_sum_ (the
@@ -2512,46 +2539,62 @@ namespace {
 // first, then the six risk setter statements.
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentEntry& row) {
+    source::admit_strategy_entry(row.id, row.is_long, row.limit_price, row.stop_price,
+                                 row.qty, row.comment, row.oca_name, row.oca_type, row.qty_type);
     adapter.entry(row.id, row.is_long, row.limit_price, row.stop_price, row.qty, row.comment,
                   row.oca_name, row.oca_type, row.qty_type);
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentClose& row) {
+    source::admit_strategy_close(row.id, row.comment, row.qty, row.qty_percent, row.immediately);
     adapter.close(row.id, row.comment, row.qty, row.qty_percent, row.immediately);
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentCloseToken& row) {
+    source::admit_strategy_close_token(row.id, row.comment, row.qty, row.qty_percent,
+                                       row.immediately, row.callsite_token);
     adapter.close(row.id, row.comment, row.qty, row.qty_percent, row.immediately,
                   row.callsite_token);
 }
 void replay_intent(source::PineExecutionAdapter& adapter, const source::detail::IntentCloseAll&) {
+    source::admit_strategy_close_all();
     adapter.close_all();
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentExit& row) {
+    source::admit_strategy_exit(row.id, row.from_entry, row.limit_price, row.stop_price,
+                                row.trail_points, row.trail_offset, row.trail_price,
+                                row.qty_percent, row.comment, row.qty, row.oca_name,
+                                row.profit_ticks, row.loss_ticks);
     adapter.exit(row.id, row.from_entry, row.limit_price, row.stop_price, row.trail_points,
                  row.trail_offset, row.trail_price, row.qty_percent, row.comment, row.qty,
                  row.oca_name, row.profit_ticks, row.loss_ticks);
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentExitCancelBracket& row) {
+    source::admit_strategy_exit_cancel_bracket(row.exit_id, row.from_entry, row.comment);
     adapter.exit_cancel_bracket(row.exit_id, row.from_entry, row.comment);
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentCancel& row) {
+    source::admit_strategy_cancel(row.id);
     adapter.cancel(row.id);
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentCancelAll&) {
+    source::admit_strategy_cancel_all();
     adapter.cancel_all();
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentOrder& row) {
+    source::admit_strategy_order(row.id, row.is_long, row.qty, row.limit_price, row.stop_price,
+                                 row.oca_name, row.oca_type);
     adapter.order(row.id, row.is_long, row.qty, row.limit_price, row.stop_price, row.oca_name,
                   row.oca_type);
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentRiskDirection& row) {
+    // The retained int direction/count/cap rows cannot carry NaN/infinity.
     adapter.set_risk_direction(row.direction);
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
@@ -2560,10 +2603,12 @@ void replay_intent(source::PineExecutionAdapter& adapter,
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentRiskMaxDrawdown& row) {
+    admit_pine_risk_max_drawdown(row.value, row.percent);
     adapter.set_risk_max_drawdown(row.value, row.percent);
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentRiskMaxIntradayLoss& row) {
+    admit_pine_risk_max_intraday_loss(row.value, row.percent);
     adapter.set_risk_max_intraday_loss(row.value, row.percent);
 }
 // As the host setter: the script's own statement adopts the count switches first.
@@ -2574,6 +2619,7 @@ void replay_intent(source::PineExecutionAdapter& adapter,
 }
 void replay_intent(source::PineExecutionAdapter& adapter,
                    const source::detail::IntentRiskMaxPositionSize& row) {
+    admit_pine_risk_max_position_size(row.value);
     adapter.set_risk_max_position_size(row.value);
 }
 
@@ -2666,6 +2712,7 @@ void source::PineStrategyHost::selected_replay_at_open(const Bar& bar,
     // then its receipts and the legs staged before its body, as
     // scheduler_publish_source_bar takes them.
     state->replay_point = &state->terminal_point;
+    assert_admitted_pine_replay_risk_config(state->start_risk);
     adapter_.restore_replay_risk_config(state->start_risk);
     adapter_.set_configuration(state->start_config);
     adapter_.begin_source_evaluation();
@@ -2690,6 +2737,7 @@ void source::PineStrategyHost::selected_replay_at_open(const Bar& bar,
     // never a counter), then the drains every source evaluation ends with.
     state->replay_point = &state->terminal_point;
     adapter_.set_configuration(state->end_config);
+    assert_admitted_pine_replay_risk_config(state->end_risk);
     adapter_.restore_replay_risk_config(state->end_risk);
     finish_adapter_evaluation();
     stop_if_failed();

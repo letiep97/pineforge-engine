@@ -1659,6 +1659,14 @@ public:
     // Read-only fixture facade for command-boundary rows that have not yet
     // become live native requests.  It never participates in matching.
     std::vector<FixturePendingSnapshot> fixture_pending_snapshots() const;
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+    // Ownership boundary control: bypass source admission for a stored limit.
+    // Inline, no new state; absent from ordinary builds.
+    void fixture_value_invalid_drawdown_limit(double value, bool percent) noexcept {
+        risk_.max_drawdown = value;
+        risk_.max_drawdown_percent = percent;
+    }
+#endif
     // Fixture-only read of the source cohort's currently live quantity. It
     // projects the adapter's truthful opening facts; it does not recreate the
     // deleted executable id ledger.
@@ -2193,7 +2201,7 @@ private:
     void defer_declined_reversal_exits_at_adverse(const Bar&,
                                                   const NativeDecisionContext&,
                                                   bool margin_scheduled);
-    bool intraday_loss_breached(double mark_price) const noexcept;
+    bool intraday_loss_breached(double mark_price) const;
     bool submit_intraday_loss_close(double mark_price, const NativeDecisionContext&,
                                     bool execute_current);
     void schedule_intraday_loss_path(const Bar&, const NativeDecisionContext&);
@@ -2318,7 +2326,7 @@ private:
     // policy: the money the percentage is taken of (with its equity mark and
     // its ten-significant-digit rounding), whether a percentage fee is
     // reserved out of it, and the lot floor applied to the core's quotient.
-    double default_sizing_cash(const PineSizingSnapshot&) const noexcept;
+    double default_sizing_cash(const PineSizingSnapshot&) const;
     bool default_sizing_reserves_percent_fee() const noexcept;
     // A percent-of-equity default quantity under a cash commission (per
     // order or per contract) takes its percentage of strategy.equity and
@@ -2340,9 +2348,9 @@ private:
     // and the sided intent a re-lowerable opening carries.  std::nullopt keeps
     // the host-resolved shape for every path the core cannot name.
     std::optional<native_order::Sized> default_sizing_shape(
-        const PineSizingSnapshot&) const noexcept;
+        const PineSizingSnapshot&) const;
     std::optional<native_order::Sized> default_sizing_intent(
-        const PineSizingSnapshot&, bool is_long) const noexcept;
+        const PineSizingSnapshot&, bool is_long) const;
     // True when the price the core will freeze for a Sized opening accepted
     // NOW is bit-for-bit the price this snapshot already froze.  A command
     // deferred to a later execution point, or one whose sizing price the

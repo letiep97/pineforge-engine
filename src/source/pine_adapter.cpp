@@ -10,6 +10,7 @@
 #include <pineforge/timeframe.hpp>
 
 #include "../engine_internal.hpp"
+#include "../engine_value_invalid.hpp"
 #include "../native_execution_consumer.hpp"
 #include <pineforge/compat/pine/trail_ticks.hpp>
 #include "../timezone.hpp"
@@ -18,6 +19,8 @@
 #include "../compat/pine/callback_lifecycle_rules.hpp"
 #include "pine_reissue_binding.hpp"
 #include "pine_run_failure.hpp"
+#include "pine_checked_arith.hpp"
+#include "pine_value_admission.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -47,6 +50,14 @@
 #define PF_RARE(condition) __builtin_expect(static_cast<bool>(condition), 0)
 
 namespace pineforge::source {
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+namespace {
+thread_local double (*adapter_execution_value_fixture)(const char*, double) = nullptr;
+}
+void fixture_adapter_execution_values(double (*fixture)(const char*, double)) noexcept {
+    adapter_execution_value_fixture = fixture;
+}
+#endif
 bool PineExecutionAdapter::modeled_input() const {
     if (input_scheduler_ && input_scheduler_->input_is_observed_ticks()) {
         return false;
@@ -59,6 +70,19 @@ bool PineExecutionAdapter::modeled_input() const {
 namespace {
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+
+void check_slippage_fill_price(double value, bool has_basis) {
+    if (has_basis && !std::isfinite(value)) {
+        engine_command_value_invalid_or_count("slippage.fill_price", EngineValueStage::slippage,
+                                              EngineValueReason::numeric_overflow);
+    }
+}
+
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+double fixture_adapter_execution_value(const char* site, double value) {
+    return adapter_execution_value_fixture ? adapter_execution_value_fixture(site, value) : value;
+}
+#endif
 
 bool same_double_bits(double left, double right) noexcept {
     std::uint64_t left_bits = 0;
@@ -292,8 +316,22 @@ bool source_same_point(double booked, double raw, double tick) noexcept {
             && nearest_tick(raw, tick) == booked);
 }
 
-double directional_tick(double value, double tick, bool upward) noexcept {
+// Only raw door callers supply a literal field. Derived prices retain the
+// original arithmetic; no source ownership is inferred from their bits.
+double source_arith_value(const std::optional<double>& value, const char* field) {
+    if (!value)
+        throw_strategy_value_invalid(field, StrategyValueReason::numeric_overflow);
+    return *value;
+}
+
+double directional_tick(double value, double tick, bool upward,
+                        const char* field = nullptr) {
     if (!std::isfinite(value) || !finite_positive(tick)) return value;
+    if (field) {
+        const double scaled = source_arith_value(checked_div(value, tick), field);
+        return source_arith_value(checked_mul(
+            upward ? std::ceil(scaled - 1e-9) : std::floor(scaled + 1e-9), tick), field);
+    }
     const double scaled = value / tick;
     return (upward ? std::ceil(scaled - 1e-9) : std::floor(scaled + 1e-9)) * tick;
 }
@@ -326,14 +364,17 @@ int price_grid_decimals(double tick) noexcept {
     return -1;
 }
 
-double source_level_on_price_grid(double level, double tick) noexcept {
+double source_level_on_price_grid(double level, double tick,
+                                 const char* field = nullptr) {
     if (!std::isfinite(level)) return level;
     const int digits = price_grid_decimals(tick);
     if (digits < 0) return level;
     double price_scale = 1.0;
     for (int i = 0; i < digits; ++i) price_scale *= 10.0;
     const double point_size = 1.0 / price_scale;
-    const double points = level / point_size;
+    const double points = field
+        ? source_arith_value(checked_div(level, point_size), field)
+        : level / point_size;
     const double grid = std::floor(points + 0.5);
     if (std::abs(points - grid) <= 0.01 / price_scale)
         return grid / price_scale;
@@ -341,19 +382,21 @@ double source_level_on_price_grid(double level, double tick) noexcept {
 }
 
 double source_trigger_threshold(double level, double tick,
-                                bool is_buy, bool is_limit) noexcept {
+                                bool is_buy, bool is_limit,
+                                const char* field = nullptr) {
     if (!std::isfinite(level) || !finite_positive(tick)) return level;
     // ab9714be pine_strategy_commands.cpp:533-537: 0.0 is a valid stop level.
     // The native matcher's finite_non_negative trigger validator refuses negative
     // levels, so a non-positive trigger cannot be shifted half a tick lower.
     if (level <= 0.0) return 0.0;
     const bool upward = is_limit ? !is_buy : is_buy;
-    double scaled = level / tick;
+    double scaled = field ? source_arith_value(checked_div(level, tick), field) : level / tick;
     const double inverse = 1.0 / tick;
     const double integral_inverse = std::floor(inverse + 0.5);
     if (integral_inverse > 0.0
         && std::abs(inverse - integral_inverse) <= 1e-6 * integral_inverse) {
-        scaled = level * integral_inverse;
+        scaled = field ? source_arith_value(checked_mul(level, integral_inverse), field)
+                       : level * integral_inverse;
         const double nearest_index = std::floor(scaled + 0.5);
         if (source_bar_fill_tick(level, tick) == level)
             scaled = nearest_index;
@@ -361,14 +404,19 @@ double source_trigger_threshold(double level, double tick,
     const double target_index = upward
         ? std::ceil(scaled - 1e-12)
         : std::floor(scaled + 1e-12);
-    const double grid = target_index * tick;
-    double threshold = grid + (upward ? -0.5 : 0.5) * tick;
+    const double grid = field ? source_arith_value(checked_mul(target_index, tick), field)
+                             : target_index * tick;
+    double threshold = field
+        ? source_arith_value(checked_add(grid, (upward ? -0.5 : 0.5) * tick), field)
+        : grid + (upward ? -0.5 : 0.5) * tick;
     // Materialize the exact binary64 boundary using the same half-up broker
     // projection as the legacy trigger bar. Decimal half ticks can land one
     // or two ULPs to either side depending on the literal and multiplication
     // order (11.805 and 13.775 are the two pinned opposite cases).
     const auto reaches_target = [&](double price) {
-        const double rounded_index = std::floor(price / tick + 0.5);
+        const double rounded_index = field
+            ? std::floor(source_arith_value(checked_div(price, tick), field) + 0.5)
+            : std::floor(price / tick + 0.5);
         return upward ? rounded_index >= target_index
                       : rounded_index <= target_index;
     };
@@ -387,6 +435,10 @@ double source_trigger_threshold(double level, double tick,
         if (!reaches_target(candidate)) break;
         threshold = candidate;
     }
+    // An infinite outside candidate can be rejected by the walk. Only an
+    // installed boundary derived from this finite raw level is an overflow.
+    if (field && !std::isfinite(threshold))
+        throw_strategy_value_invalid(field, StrategyValueReason::numeric_overflow);
     return threshold;
 }
 
@@ -719,7 +771,14 @@ namespace {
 // trail_points as whole ticks (compat::pine::trail_points_to_ticks): with
 // the mintick-scaled tolerance TradingView applies, or the constant one when
 // the trail switch is off.
-double source_trail_points_ticks(double trail_points, double mintick) noexcept {
+double source_trail_points_ticks(double trail_points, double mintick,
+                                 const char* field = nullptr) {
+    if (field && finite_positive(mintick)
+        && detail::pine_callback_lifecycle_rule(detail::PineCallbackLifecycleRule::TrailPointsMintickTolerance)) {
+        const double tolerance = source_arith_value(checked_mul(
+            compat::pine::kTrailPointsCeilMintickScale, mintick), field);
+        return std::ceil(source_arith_value(checked_add(trail_points, -tolerance), field));
+    }
     return detail::pine_callback_lifecycle_rule(detail::PineCallbackLifecycleRule::TrailPointsMintickTolerance)
         ? compat::pine::trail_points_to_ticks(trail_points, mintick)
         : compat::pine::trail_points_to_ticks(trail_points);
@@ -3007,27 +3066,74 @@ PineSizingSnapshot PineExecutionAdapter::sizing_snapshot() const {
 // entries and strategy.order, point values 1 and 50) and all 366 trades of
 // corpus order-percent-equity-cash-commission-01.
 double PineExecutionAdapter::default_sizing_cash(
-        const PineSizingSnapshot& sizing) const noexcept {
+        const PineSizingSnapshot& sizing) const {
     if (config_.default_qty_type == static_cast<int>(QtyType::CASH)) {
+        if (!std::isfinite(config_.default_qty_value)) {
+            engine_command_value_invalid_or_count("sizing.quantity", EngineValueStage::sizing,
+                                                 EngineValueReason::nonfinite);
+        }
         return config_.default_qty_value;
     }
     if (config_.default_qty_type != static_cast<int>(QtyType::PERCENT_OF_EQUITY)) return kNaN;
     if (default_sizing_reserves_cash_fee()) {
-        if (!finite_positive(sizing.strategy_equity)) return kNaN;
+        if (!finite_positive(sizing.strategy_equity)) {
+            if (!std::isfinite(sizing.strategy_equity)) {
+                engine_command_value_invalid_or_count("sizing.basis", EngineValueStage::sizing,
+                                                     EngineValueReason::nonfinite);
+            }
+            return kNaN;
+        }
         const double equity = staged_.quantity_grid ? source_money_round(sizing.strategy_equity)
                                                     : sizing.strategy_equity;
         const double money = config_.default_qty_value / 100.0 * equity;
-        if (config_.commission_type == static_cast<int>(CommissionType::CASH_PER_ORDER))
-            return money - config_.commission_value;
+        if (!std::isfinite(money)) {
+            engine_command_value_invalid_or_count("sizing.quantity", EngineValueStage::sizing,
+                                                 EngineValueReason::nonfinite);
+        }
+        if (config_.commission_type == static_cast<int>(CommissionType::CASH_PER_ORDER)) {
+            const double cash = money - config_.commission_value;
+            if (!std::isfinite(cash)) {
+                engine_command_value_invalid_or_count("sizing.quantity", EngineValueStage::sizing,
+                                                     EngineValueReason::nonfinite);
+            }
+            return cash;
+        }
         // The core converts cash / unit_cost; this cash leaves
         // units * (unit_cost + fee) == money.
         const double unit_cost = sizing.price * staged_.syminfo.pointvalue * sizing.fx;
-        if (!finite_positive(unit_cost)) return kNaN;
-        return money * unit_cost / (unit_cost + config_.commission_value);
+        if (!finite_positive(unit_cost)) {
+            if (!std::isfinite(unit_cost)) {
+                engine_command_value_invalid_or_count("sizing.quantity", EngineValueStage::sizing,
+                                                     EngineValueReason::nonfinite);
+            }
+            return kNaN;
+        }
+        const double divisor = unit_cost + config_.commission_value;
+        if (!std::isfinite(divisor)) {
+            engine_command_value_invalid_or_count("sizing.quantity", EngineValueStage::sizing,
+                                                 EngineValueReason::nonfinite);
+        }
+        const double cash = money * unit_cost / divisor;
+        if (!std::isfinite(cash)) {
+            engine_command_value_invalid_or_count("sizing.quantity", EngineValueStage::sizing,
+                                                 EngineValueReason::nonfinite);
+        }
+        return cash;
     }
-    if (!finite_positive(sizing.equity)) return kNaN;
+    if (!finite_positive(sizing.equity)) {
+        if (!std::isfinite(sizing.equity)) {
+            engine_command_value_invalid_or_count("sizing.basis", EngineValueStage::sizing,
+                                                 EngineValueReason::nonfinite);
+        }
+        return kNaN;
+    }
     const double money = config_.default_qty_value / 100.0 * sizing.equity;
-    return staged_.quantity_grid ? source_money_round(money) : money;
+    const double cash = staged_.quantity_grid ? source_money_round(money) : money;
+    if (!std::isfinite(money) || !std::isfinite(cash)) {
+        engine_command_value_invalid_or_count("sizing.quantity", EngineValueStage::sizing,
+                                             EngineValueReason::nonfinite);
+    }
+    return cash;
 }
 
 // A percentage declaration reserves a percentage commission out of its own
@@ -3074,7 +3180,7 @@ double PineExecutionAdapter::default_sizing_lot_floor(double units) const noexce
 // the CashValue basis, the core's fee reserve, the raw quotient for the source
 // lot floor, frozen at acceptance against the signal rule.  No money, no shape.
 std::optional<native_order::Sized> PineExecutionAdapter::default_sizing_shape(
-        const PineSizingSnapshot& sizing) const noexcept {
+        const PineSizingSnapshot& sizing) const {
     const double cash = default_sizing_cash(sizing);
     if (!finite_positive(cash)) return std::nullopt;
     native_order::Sized sized;
@@ -3091,7 +3197,13 @@ std::optional<native_order::Sized> PineExecutionAdapter::default_sizing_shape(
 // money band is a source policy"), so the source asks the core for its own
 // conversion and floors it -- the arithmetic exists once (R5 N11).
 double PineExecutionAdapter::default_sizing_units(const PineSizingSnapshot& sizing) const {
-    if (!finite_positive(sizing.price) || !finite_positive(sizing.fx)) return 0.0;
+    if (!finite_positive(sizing.price) || !finite_positive(sizing.fx)) {
+        if (!std::isfinite(sizing.price) || !std::isfinite(sizing.fx)) {
+            engine_command_value_invalid_or_count("sizing.quantity", EngineValueStage::sizing,
+                                                 EngineValueReason::nonfinite);
+        }
+        return 0.0;
+    }
     const auto sized = default_sizing_shape(sizing);
     if (!sized) return 0.0;
     const auto quotient = require_host().native_sized_units(
@@ -3141,7 +3253,7 @@ std::optional<double> PineExecutionAdapter::typed_entry_units(
 }
 
 std::optional<native_order::Sized> PineExecutionAdapter::default_sizing_intent(
-        const PineSizingSnapshot& sizing, bool is_long) const noexcept {
+        const PineSizingSnapshot& sizing, bool is_long) const {
     // The core converts at the run's own point value; whether it also converts
     // at the source's FX rate is decided where it accepts the command
     // (core_sizing_price_matches), so a staged FX series keeps this shape.
@@ -3214,13 +3326,25 @@ std::optional<double> PineExecutionAdapter::pooc_fee_units(
 // fee factor: guard (e) of tests/test_adapter_sizing_relower.cpp allows the
 // spelling inside this function alone, by an explicit exception.
 double PineExecutionAdapter::tv_pooc_fee_grossed_unit(double price) const {
-    return source_money_round(price * (1.0 + config_.commission_value / 100.0));
+    double unit = source_money_round(price * (1.0 + config_.commission_value / 100.0));
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+    unit = fixture_adapter_execution_value("fee.adapter.grossed_unit", unit);
+#endif
+    if (std::isfinite(price) && !std::isfinite(unit)) {
+        engine_command_value_invalid_or_count("fee.commission", EngineValueStage::fee,
+                                              EngineValueReason::numeric_overflow);
+    }
+    return unit;
 }
 
 bool PineExecutionAdapter::core_sizes_default_opening(bool is_long) const {
     PineSizingSnapshot sizing = sizing_snapshot();
     if (!finite_positive(sizing.mark)) return false;
     sizing.price = default_market_sizing_price(sizing.mark, is_long);
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+    sizing.price = fixture_adapter_execution_value("slippage.default.core", sizing.price);
+#endif
+    check_slippage_fill_price(sizing.price, std::isfinite(sizing.mark));
     mark_sizing_equity(sizing, sizing.mark);
     return finite_positive(default_sizing_units(sizing))
         && default_sizing_intent(sizing, is_long).has_value()
@@ -5037,7 +5161,14 @@ void PineExecutionAdapter::record_opening_fee(
         const double total = opened + std::abs(event.closed_units);
         fee = total > 0.0 ? config_.commission_value * opened / total : 0.0;
     }
-    if (!std::isfinite(fee)) return;
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+    fee = fixture_adapter_execution_value("fee.adapter.opening", fee);
+#endif
+    if (!std::isfinite(fee)) {
+        engine_command_value_invalid_or_count("fee.commission", EngineValueStage::fee,
+                                              EngineValueReason::numeric_overflow);
+        return;
+    }
     open_entry_fees_.push_back({event.handle(), source.source_id, opened, fee});
 }
 
@@ -7126,8 +7257,10 @@ void PineExecutionAdapter::place_entry(const SourceId& id, bool is_long, double 
             }
         }
     }
-    limit_price = source_level_on_price_grid(limit_price, staged_.syminfo.mintick);
-    stop_price = source_level_on_price_grid(stop_price, staged_.syminfo.mintick);
+    limit_price = source_level_on_price_grid(
+        limit_price, staged_.syminfo.mintick, value_field::entry_limit_price);
+    stop_price = source_level_on_price_grid(
+        stop_price, staged_.syminfo.mintick, value_field::entry_stop_price);
     const bool pure_stop_entry = std::isnan(limit_price)
         && finite_positive(stop_price);
     if (intraday_loss_orders_blocked()
@@ -7231,6 +7364,18 @@ void PineExecutionAdapter::place_entry(const SourceId& id, bool is_long, double 
                 : mark;
             const double required = units * admission_mark
                 * staged_.syminfo.pointvalue * fx * margin / 100.0;
+            // Finite explicit overflow is a signal-time refusal below, with
+            // cancellation and callback continuation. Nonfinite inputs or
+            // equity still fault before that refusal.
+            const bool finite_explicit_requirement = std::isfinite(units)
+                && std::isfinite(admission_mark) && std::isfinite(staged_.syminfo.pointvalue)
+                && std::isfinite(fx);
+            if (finite_positive(margin) && margin <= 100.0
+                && ((!std::isfinite(required) && !finite_explicit_requirement)
+                    || !std::isfinite(equity))) {
+                engine_command_value_invalid_or_count("margin.required", EngineValueStage::margin,
+                                                     EngineValueReason::nonfinite);
+            }
             // Margin rule 2: an explicit quantity opening from flat at full
             // margin, market, or a stop under process_orders_on_close, is
             // judged at its signal close c' =
@@ -7338,6 +7483,10 @@ void PineExecutionAdapter::place_entry(const SourceId& id, bool is_long, double 
             units = kNaN;
             if (finite_positive(sizing.mark)) {
                 sizing.price = default_market_sizing_price(sizing.mark, is_long);
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+                sizing.price = fixture_adapter_execution_value("slippage.default.signal", sizing.price);
+#endif
+                check_slippage_fill_price(sizing.price, std::isfinite(sizing.mark));
                 mark_sizing_equity(sizing, sizing.mark);
                 units = default_sizing_units(sizing);
             }
@@ -7654,7 +7803,8 @@ void PineExecutionAdapter::place_entry(const SourceId& id, bool is_long, double 
         && config_.default_qty_value <= 100.0;
     double default_stop_sizing_price = kNaN;
     if (default_stop_freeze && finite_positive(staged_.syminfo.mintick)) {
-        stop_price = directional_tick(stop_price, staged_.syminfo.mintick, is_long);
+        stop_price = directional_tick(
+            stop_price, staged_.syminfo.mintick, is_long, value_field::entry_stop_price);
         const double signal = source_point
             ? nearest_tick(source_point->price, staged_.syminfo.mintick) : kNaN;
         if (config_.process_orders_on_close && source_level_on_price_grid(stop_price, staged_.syminfo.mintick) == source_level_on_price_grid(signal, staged_.syminfo.mintick)) {
@@ -7666,6 +7816,12 @@ void PineExecutionAdapter::place_entry(const SourceId& id, bool is_long, double 
         // ab9714be pine_strategy_commands.cpp:325-328: pure stop placement sizing price includes directional slippage ticks
         const double slip = (is_long ? 1.0 : -1.0) * config_.slippage * staged_.syminfo.mintick;
         default_stop_sizing_price = (marketable ? signal : stop_price) + slip;
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+        default_stop_sizing_price = fixture_adapter_execution_value(
+            "slippage.default.stop", default_stop_sizing_price);
+#endif
+        check_slippage_fill_price(default_stop_sizing_price,
+                                  std::isfinite(marketable ? signal : stop_price));
     }
     if (default_sized || typed_sized || direction_blocked || affordability_reversal_candidate) {
         request.intent = native_order::HostSized{native_order::HostSizedKind::Open,
@@ -7729,11 +7885,11 @@ void PineExecutionAdapter::place_entry(const SourceId& id, bool is_long, double 
         // tick-quantized bar, so an off-grid level triggers on the half-up
         // rounded print (NYSE:F ORB 10.845 / 11.425 / 11.89 limits).
         native_limit = source_trigger_threshold(
-            limit_price, staged_.syminfo.mintick, is_long, true);
+            limit_price, staged_.syminfo.mintick, is_long, true, value_field::entry_limit_price);
     } else if (finite_positive(stop_price) && !finite_positive(limit_price)
                && !config_.calc_on_order_fills) {
         native_stop = source_trigger_threshold(
-            stop_price, staged_.syminfo.mintick, is_long, false);
+            stop_price, staged_.syminfo.mintick, is_long, false, value_field::entry_stop_price);
     }
     const auto* pine_host = pine_view_of(&require_host());
     const bool nonpositive_priced = priced && pine_host
@@ -7766,6 +7922,10 @@ void PineExecutionAdapter::place_entry(const SourceId& id, bool is_long, double 
             next_extreme, staged_.syminfo.mintick)
             + (is_long ? 1.0 : -1.0) * config_.slippage
                 * staged_.syminfo.mintick;
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+        coof_market_fill = fixture_adapter_execution_value("slippage.recalc.entry", coof_market_fill);
+#endif
+        check_slippage_fill_price(coof_market_fill, std::isfinite(next_extreme));
         if (finite_positive(coof_market_fill) && finite_positive(current_quote)
             && !source_same_point(current_quote, coof_market_fill, staged_.syminfo.mintick)) {
             const bool falling = coof_market_fill < current_quote;
@@ -7796,6 +7956,10 @@ void PineExecutionAdapter::place_entry(const SourceId& id, bool is_long, double 
         coof_market_fill = nearest_tick(next_extreme, staged_.syminfo.mintick)
             + (is_long ? 1.0 : -1.0) * config_.slippage
                 * staged_.syminfo.mintick;
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+        coof_market_fill = fixture_adapter_execution_value("slippage.recalc.entry_tick", coof_market_fill);
+#endif
+        check_slippage_fill_price(coof_market_fill, std::isfinite(next_extreme));
     }
     if (pure_stop_entry && explicit_fixed && current != 0.0
         && ((current > 0.0) != is_long) && source_point
@@ -8107,6 +8271,10 @@ void PineExecutionAdapter::place_entry(const SourceId& id, bool is_long, double 
     }
     if (default_sized && !priced && finite_positive(snapshot.sizing.mark)) {
         snapshot.sizing.price = default_market_sizing_price(snapshot.sizing.mark, is_long);
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+        snapshot.sizing.price = fixture_adapter_execution_value("slippage.default.snapshot", snapshot.sizing.price);
+#endif
+        check_slippage_fill_price(snapshot.sizing.price, std::isfinite(snapshot.sizing.mark));
         mark_sizing_equity(snapshot.sizing, snapshot.sizing.mark);
     }
     const auto predecessor = live_by_source_key_.find(key_for(id));
@@ -8380,6 +8548,18 @@ void PineExecutionAdapter::place_entry(const SourceId& id, bool is_long, double 
         }
         const double required = (charged_held + std::abs(own_units)) * signal * staged_.syminfo.pointvalue
             * snapshot.sizing.fx * margin / 100.0;
+        // The flat/same-side refusal below also owns finite explicit overflow.
+        // Default sizing, reversals and nonfinite inputs retain the G fault.
+        const bool finite_explicit_rejection = !default_sized && !reverses
+            && std::isfinite(charged_held) && std::isfinite(own_units)
+            && std::isfinite(signal) && std::isfinite(staged_.syminfo.pointvalue)
+            && std::isfinite(snapshot.sizing.fx) && std::isfinite(margin);
+        if (margin > 0.0
+            && ((!std::isfinite(required) && !finite_explicit_rejection)
+                || !std::isfinite(snapshot.sizing.equity))) {
+            engine_command_value_invalid_or_count("margin.required", EngineValueStage::margin,
+                                                 EngineValueReason::nonfinite);
+        }
         const double epsilon = std::max(1e-9, std::abs(snapshot.sizing.equity) * 1e-12);
         snapshot.projection_affordability_equity = snapshot.sizing.equity;
         snapshot.projection_affordability_signal_price = signal;
@@ -10113,6 +10293,10 @@ void PineExecutionAdapter::close(const SourceId& id, const std::string& comment,
             next_waypoint, staged_.syminfo.mintick)
             + (buy ? 1.0 : -1.0) * config_.slippage
                 * staged_.syminfo.mintick;
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+        coof_close_fill = fixture_adapter_execution_value("slippage.recalc.close", coof_close_fill);
+#endif
+        check_slippage_fill_price(coof_close_fill, std::isfinite(next_waypoint));
         if (finite_positive(coof_close_fill) && finite_positive(current_quote)
             && !source_same_point(current_quote, coof_close_fill, staged_.syminfo.mintick)) {
             // ab9714be pine_scheduler.cpp:541-563 fills the recalc's market
@@ -11106,15 +11290,30 @@ void PineExecutionAdapter::exit(const SourceId& exit_id, const SourceId& from_en
     }
     if (known_parent_level && finite_positive(entry_price) && finite_positive(tick)) {
         const bool long_side = physical.signed_units != 0.0 ? physical.signed_units > 0.0 : parent_long;
-        if (!finite_positive(limit_price) && finite_positive(profit_ticks))
+        if (!finite_positive(limit_price) && finite_positive(profit_ticks)) {
             limit_price = entry_price + (long_side ? 1.0 : -1.0) * profit_ticks * tick;
-        if (!finite_positive(stop_price) && finite_positive(loss_ticks))
+            if (!std::isfinite(limit_price)) {
+                engine_command_value_invalid_or_count("relative_price.level",
+                    EngineValueStage::relative_price, EngineValueReason::numeric_overflow);
+            }
+        }
+        if (!finite_positive(stop_price) && finite_positive(loss_ticks)) {
             stop_price = entry_price - (long_side ? 1.0 : -1.0) * loss_ticks * tick;
+            if (!std::isfinite(stop_price)) {
+                engine_command_value_invalid_or_count("relative_price.level",
+                    EngineValueStage::relative_price, EngineValueReason::numeric_overflow);
+            }
+        }
         if (std::isfinite(source_trail_points)) {
-            const double trail_ticks = source_trail_points_ticks(source_trail_points, tick);
+            const double trail_ticks = source_trail_points_ticks(
+                source_trail_points, tick, value_field::exit_trail_points);
             trail_price = directional_tick(entry_price
                 + (long_side ? 1.0 : -1.0) * trail_ticks * tick,
                 tick, long_side);
+            if (std::isfinite(trail_ticks) && !std::isfinite(trail_price)) {
+                engine_command_value_invalid_or_count("relative_price.level",
+                    EngineValueStage::relative_price, EngineValueReason::numeric_overflow);
+            }
         }
     }
     limit_price = source_level_on_price_grid(limit_price, tick);
@@ -13815,10 +14014,18 @@ void PineExecutionAdapter::materialize_relative_exits(
         if (finite_positive(value.profit_ticks)) {
             limit = directional_tick(event.resolved_price + side * value.profit_ticks * tick,
                                      tick, opening.is_long);
+            if (std::isfinite(event.resolved_price) && !std::isfinite(limit)) {
+                engine_command_value_invalid_or_count("relative_price.level",
+                    EngineValueStage::relative_price, EngineValueReason::numeric_overflow);
+            }
         }
         if (finite_positive(value.loss_ticks)) {
             stop = directional_tick(event.resolved_price - side * value.loss_ticks * tick,
                                     tick, !opening.is_long);
+            if (std::isfinite(event.resolved_price) && !std::isfinite(stop)) {
+                engine_command_value_invalid_or_count("relative_price.level",
+                    EngineValueStage::relative_price, EngineValueReason::numeric_overflow);
+            }
         }
         // An omitted trail_offset is a one-shot activation leg in Pine.  Do
         // not synthesize a trailing distance from trail_points here; an
@@ -14454,8 +14661,10 @@ void PineExecutionAdapter::order(const SourceId& id, bool is_long, double qty,
     double risk_coof_forced_price = kNaN;
     double coof_market_fill = kNaN;
     bool delay_after_default_pair = false;
-    limit_price = source_level_on_price_grid(limit_price, staged_.syminfo.mintick);
-    stop_price = source_level_on_price_grid(stop_price, staged_.syminfo.mintick);
+    limit_price = source_level_on_price_grid(
+        limit_price, staged_.syminfo.mintick, value_field::order_limit_price);
+    stop_price = source_level_on_price_grid(
+        stop_price, staged_.syminfo.mintick, value_field::order_stop_price);
     const bool default_sized = std::isnan(qty);
     const double normalized_qty = default_sized ? qty
         : floor_quantity_grid(std::abs(qty), staged_.quantity_grid);
@@ -14473,11 +14682,11 @@ void PineExecutionAdapter::order(const SourceId& id, bool is_long, double qty,
     double native_stop = stop_price;
     if (finite_positive(limit_price) && !finite_positive(stop_price)) {
         native_limit = source_trigger_threshold(
-            limit_price, staged_.syminfo.mintick, is_long, true);
+            limit_price, staged_.syminfo.mintick, is_long, true, value_field::order_limit_price);
     } else if (finite_positive(stop_price) && !finite_positive(limit_price)
                && !config_.calc_on_order_fills) {
         native_stop = source_trigger_threshold(
-            stop_price, staged_.syminfo.mintick, is_long, false);
+            stop_price, staged_.syminfo.mintick, is_long, false, value_field::order_stop_price);
     }
     request.trigger = trigger_for(native_limit, native_stop);
     if (coof_recalc_active_ && coof_first_open_) {
@@ -14498,6 +14707,10 @@ void PineExecutionAdapter::order(const SourceId& id, bool is_long, double qty,
                 next_waypoint, staged_.syminfo.mintick)
                 + (is_long ? 1.0 : -1.0) * config_.slippage
                     * staged_.syminfo.mintick;
+#ifdef PINEFORGE_VALUE_INVALID_FIXTURES
+            coof_market_fill = fixture_adapter_execution_value("slippage.recalc.order", coof_market_fill);
+#endif
+            check_slippage_fill_price(coof_market_fill, std::isfinite(next_waypoint));
             if (finite_positive(next_waypoint) && finite_positive(current_quote)
                 && !source_same_point(current_quote, next_waypoint, staged_.syminfo.mintick)) {
                 const bool falling = next_waypoint < current_quote;
@@ -17283,6 +17496,10 @@ void PineExecutionAdapter::update_risk_state(double mark_price) {
         const double threshold = risk_.max_drawdown_percent
             ? risk_.observed_peak_equity * risk_.max_drawdown / 100.0
             : risk_.max_drawdown;
+        if (std::isfinite(risk_.max_drawdown) && !std::isfinite(threshold)) {
+            engine_command_value_invalid_or_count("risk.threshold",
+                EngineValueStage::risk, EngineValueReason::numeric_overflow);
+        }
         if (risk_.observed_max_drawdown >= threshold) {
             risk_.halted = true;
             return;
@@ -17294,7 +17511,7 @@ void PineExecutionAdapter::update_risk_state(double mark_price) {
     }
 }
 
-bool PineExecutionAdapter::intraday_loss_breached(double mark_price) const noexcept {
+bool PineExecutionAdapter::intraday_loss_breached(double mark_price) const {
     if (!(risk_.max_intraday_loss > 0.0) || intraday_loss_orders_blocked()
         || !std::isfinite(day_ledger_.intraday_start_equity)
         || !std::isfinite(mark_price)) {
@@ -17305,6 +17522,10 @@ bool PineExecutionAdapter::intraday_loss_breached(double mark_price) const noexc
     const double threshold = risk_.max_intraday_loss_percent
         ? day_ledger_.intraday_start_equity * risk_.max_intraday_loss / 100.0
         : risk_.max_intraday_loss;
+    if (std::isfinite(risk_.max_intraday_loss) && !std::isfinite(threshold)) {
+        engine_command_value_invalid_or_count("risk.threshold",
+            EngineValueStage::risk, EngineValueReason::numeric_overflow);
+    }
     if (!(threshold > 0.0) || !(loss > 0.0) || !std::isfinite(loss)) return false;
     const double epsilon = 1e-9 * std::max(1.0, std::abs(threshold));
     return loss + epsilon >= threshold;
@@ -24449,6 +24670,10 @@ void PineExecutionAdapter::on_applied(const native_order::ExecutionAppliedEvent&
         const double threshold = risk_.max_intraday_loss_percent
             ? day_ledger_.intraday_start_equity * risk_.max_intraday_loss / 100.0
             : risk_.max_intraday_loss;
+        if (std::isfinite(risk_.max_intraday_loss) && !std::isfinite(threshold)) {
+            engine_command_value_invalid_or_count("risk.threshold",
+                EngineValueStage::risk, EngineValueReason::numeric_overflow);
+        }
         const double epsilon = 1e-9 * std::max(1.0, std::abs(threshold));
         preclose_intraday_loss = std::isfinite(before) && threshold > 0.0
             && loss > 0.0 && loss + epsilon >= threshold;

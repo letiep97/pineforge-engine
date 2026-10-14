@@ -6,6 +6,8 @@ if(PINEFORGE_BUILD_SOURCE_LAYER)
 endif()
 
 set(TEST_SOURCES
+    test_value_invalid_relative_risk
+    test_value_invalid_relative_risk_source
     # R4-D L4a native-route behavioral twins.  These retain the legacy
     # oracle literals while driving the switched host only through its public
     # source commands and projections.
@@ -115,6 +117,7 @@ set(TEST_SOURCES
     test_native_selected_settlement
     test_native_settlement_projection
     test_native_settlement_callers
+    test_native_settlement_row_finite
     test_native_reversal_contract
     test_native_reverse_to
     test_source_exact_reversal
@@ -1592,6 +1595,9 @@ list(APPEND TEST_SOURCES test_native_bar_open_hook)
 # settlement previews each run builds (differential). Source-free, so it also
 # runs in the kernel-only profile.
 list(APPEND TEST_SOURCES test_native_precommit_hook)
+# EN-132: source-free native ownership witnesses and the source companion.
+list(APPEND TEST_SOURCES test_value_invalid_sizing_margin)
+list(APPEND TEST_SOURCES test_value_invalid_sizing_margin_source)
 # R5 lane D2-C: the library's per-thread runtime state (the TA bar context,
 # the EMA seeding default, the chart day partition) written on the pump's
 # runtime block against thread-local storage at every write -- bare hosts
@@ -1859,6 +1865,11 @@ list(APPEND TEST_SOURCES
     test_selected_window_report_integration
     test_selected_window_routes
     test_selected_production_routes
+    test_value_admission_arith
+    test_value_admission_decl
+    test_value_admission_risk
+    # EN-132 source command admission: public host, synthetic feed, no fixtures.
+    test_value_admission_doors
     # The source of test_selected_quote_seal is supplied by a separate change
     # and integrated with this registration before configure.
     test_selected_quote_seal
@@ -2253,6 +2264,9 @@ add_test(NAME test_run_json_selected_window
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 add_test(NAME test_run_json_nonfinite_report
     COMMAND ${Python3_EXECUTABLE} -B -m pytest ${PROJECT_SOURCE_DIR}/tests/test_run_json_nonfinite_report.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+add_test(NAME test_run_json_post_execution
+    COMMAND ${Python3_EXECUTABLE} -B -m pytest ${PROJECT_SOURCE_DIR}/tests/test_run_json_post_execution.py
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 add_test(NAME test_compile_inventory_pipeline
     COMMAND ${Python3_EXECUTABLE} -B -m pytest ${PROJECT_SOURCE_DIR}/tests/test_compile_inventory_pipeline.py
@@ -3677,6 +3691,95 @@ list(REMOVE_ITEM TEST_SOURCES ${_pf_private_fixture_rows})
 foreach(test_name ${TEST_SOURCES})
     pineforge_add_unit_test(${test_name})
 endforeach()
+
+# EN-134: each public C ABI fault run is also addressable for red-before and
+# mutant checks. The aggregate and these rows run in the kernel-only profile.
+foreach(_pf_settlement_row_case
+        closed_runup_nan closed_drawdown_nan
+        closed_runup_posinf closed_drawdown_posinf
+        closed_runup_neginf closed_drawdown_neginf
+        range_runup_nan range_drawdown_nan
+        range_runup_posinf range_drawdown_posinf
+        range_runup_neginf range_drawdown_neginf
+        closed_pnl_pct_overflow range_pnl_pct_overflow)
+    pineforge_add_twin_test(test_native_settlement_row_${_pf_settlement_row_case}
+        test_native_settlement_row_finite ${_pf_settlement_row_case})
+endforeach()
+pineforge_add_twin_test(test_native_settlement_row_controls
+    test_native_settlement_row_finite --controls)
+
+# EN-132 round b: real one-lot fused runs, individually selectable. All
+# round-a targets/rows retain their source-free kernel include closure.
+foreach(_pf_one_lot_row_case
+        one_lot_runup_nan one_lot_drawdown_nan
+        one_lot_runup_posinf one_lot_drawdown_posinf
+        one_lot_runup_neginf one_lot_drawdown_neginf
+        one_lot_pnl_pct_overflow
+        finite_one_lot_zero finite_one_lot_owned finite_one_lot_signed
+        kernel_one_lot_normal)
+    pineforge_add_twin_test(test_native_settlement_row_${_pf_one_lot_row_case}
+        test_native_settlement_row_finite ${_pf_one_lot_row_case})
+endforeach()
+
+# The adapter rows live in the same TU as requested, compiled a second time
+# with an explicit public source-header dependency. Only this target sees it;
+# the native target above cannot include/link the source layer in any profile.
+if(PINEFORGE_BUILD_SOURCE_LAYER)
+    add_executable(test_source_settlement_row_finite test_native_settlement_row_finite.cpp)
+    target_link_libraries(test_source_settlement_row_finite PRIVATE pineforge)
+    target_compile_options(test_source_settlement_row_finite PRIVATE -ffp-contract=off -UNDEBUG)
+    if(PINEFORGE_ENABLE_COVERAGE)
+        target_compile_options(test_source_settlement_row_finite PRIVATE ${_pf_cov_test_flags})
+    endif()
+    target_compile_definitions(test_source_settlement_row_finite PRIVATE
+        "PINEFORGE_SETTLEMENT_SOURCE_HEADER=\"pineforge/source/pine_strategy_host.hpp\"")
+    add_test(NAME test_source_settlement_row_finite COMMAND test_source_settlement_row_finite)
+    foreach(_pf_source_settlement_row_case
+            terminal_quote_pnl_pct_overflow terminal_quote_price_overflow
+            finite_terminal_quote amended_trade_commission_overflow finite_amended_trade)
+        pineforge_add_twin_test(test_source_settlement_row_${_pf_source_settlement_row_case}
+            test_source_settlement_row_finite ${_pf_source_settlement_row_case})
+    endforeach()
+    pineforge_add_twin_test(test_source_settlement_row_controls
+        test_source_settlement_row_finite --controls)
+endif()
+
+if(TARGET test_value_invalid_relative_risk_source)
+    target_compile_definitions(test_value_invalid_relative_risk_source PRIVATE
+        PINEFORGE_VALUE_INVALID_FIXTURES)
+endif()
+
+# EN-132 G2: value-injection fixtures. The fee, slippage and counter sites are
+# not reachable from any public input, so this opt-in build compiles the
+# library with PINEFORGE_VALUE_INVALID_FIXTURES (injection hooks that exist
+# only under that macro) and registers the test that drives them. The default
+# profiles never define it, so their archives carry no hook.
+option(PINEFORGE_VALUE_INVALID_FIXTURES "Build EN-132 value-injection fixtures" OFF)
+if(PINEFORGE_VALUE_INVALID_FIXTURES)
+    target_compile_definitions(pineforge PRIVATE PINEFORGE_VALUE_INVALID_FIXTURES)
+    if(TARGET pineforge_kernel)
+        target_compile_definitions(pineforge_kernel PRIVATE PINEFORGE_VALUE_INVALID_FIXTURES)
+    endif()
+    pineforge_add_unit_test(test_value_invalid_fee_slip_settle)
+    target_compile_definitions(test_value_invalid_fee_slip_settle PRIVATE
+        PINEFORGE_VALUE_INVALID_FIXTURES)
+    if(NOT PINEFORGE_BUILD_SOURCE_LAYER)
+        target_compile_definitions(test_value_invalid_fee_slip_settle PRIVATE
+            PINEFORGE_VALUE_INVALID_KERNEL_ONLY)
+    endif()
+endif()
+
+# EN-132 M: source-only ownership proof, controls, and an independent D4 route.
+add_test(NAME test_selected_window_ownership_manifest
+    COMMAND ${Python3_EXECUTABLE} -I -B ${PROJECT_SOURCE_DIR}/scripts/check_selected_window_ownership.py)
+add_test(NAME test_selected_window_ownership_manifest_controls
+    COMMAND ${Python3_EXECUTABLE} -I -B ${PROJECT_SOURCE_DIR}/tests/ownership/test_manifest_checker.py)
+add_test(NAME test_selected_window_ownership_d4
+    COMMAND ${Python3_EXECUTABLE} -I -B ${PROJECT_SOURCE_DIR}/tests/ownership/test_manifest_checker.py
+        ManifestCheckerTests.test_d4_independent_reconstruction_matches_manifest)
+set_tests_properties(test_selected_window_ownership_manifest
+    test_selected_window_ownership_manifest_controls test_selected_window_ownership_d4
+    PROPERTIES WORKING_DIRECTORY ${PROJECT_SOURCE_DIR} TIMEOUT 180)
 
 # The C bridge test also links the shared window-plan helper, whose bridge
 # (src/selected_window_plan_c.cpp) is not in the kernel archive. The loop above
