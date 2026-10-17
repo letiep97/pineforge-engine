@@ -24,6 +24,7 @@ version number follows semantic versioning over the surfaces the
   only a completeness proof (EN-115) allows `"1.3"` again. The C layouts stay
   at ABI 4, `PF_ABI_VERSION` stays 4, the selected-window wire version stays
   1, the phase version 1 and the fingerprint/schema version 2.
+- **Preflight stage timings.** `scripts/ci_preflight.py` records `startedAt` (UTC ISO-8601) and `seconds` (monotonic duration; `null` while a stage is running) on each stage and on the top-level `preflight-summary.json` summary.
 
 ## 1.6.0 — 2026-10-17
 
