@@ -139,9 +139,10 @@ GATE_NEEDS = ('needs: [changes, preflight, build, sanitizers, native-live, kerne
               'corpus-parity-subset]')
 # No stage of this preflight carries a timeout: the verifier self-tests
 # (test_ci_verify.py) drive the real literal-aware parity, receipt and
-# submodule guards in one serial process, and no bound of this file's may
-# fail a run for slowness (owner rule, 2026-10-12). A stage that hangs is
-# caught only by the job's own platform maximum, 360 minutes.
+# submodule guards across parallel unittest shards (run_unittest_shards.py),
+# and no bound of this file's may fail a run for slowness (owner rule,
+# 2026-10-12). A stage that hangs is caught only by the job's own platform
+# maximum, 360 minutes.
 # A job's header -- any id GitHub accepts -- and the top-level jobs and on keys.
 _JOB_HEADER = re.compile(r'^  ([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(?:#.*)?$', re.MULTILINE)
 _JOBS_KEY = re.compile(r'^jobs:[ \t]*(?:#.*)?$', re.MULTILINE)
@@ -640,7 +641,8 @@ def run_json_harness_command(source: Path) -> list[str]:
             '--rootdir', str(source), *(tests or [str(source / 'docker' / RUN_JSON_TESTS)])]
 
 
-def check_commands(source: Path) -> list[tuple]:
+def check_commands(source: Path, output: Path | None = None) -> list[tuple]:
+    output_dir = (source / 'build-ci-preflight') if output is None else output
     return [
         ('shellcheck-version', ['shellcheck', '--version']),
         ('workflow-lint', ['actionlint', '-color',
@@ -669,8 +671,13 @@ def check_commands(source: Path) -> list[tuple]:
          [sys.executable, str(source / 'scripts/test_check_rng_draw_order.py')]),
         ('rng-draw-order',
          [sys.executable, str(source / 'scripts/check_rng_draw_order.py')]),
-        ('verifier-tests', [sys.executable, str(source / 'scripts/test_ci_verify.py')]),
+        ('verifier-tests',
+         [sys.executable, str(source / 'scripts/run_unittest_shards.py'),
+          str(source / 'scripts/test_ci_verify.py'),
+          '--log-dir', str(output_dir / 'verifier-tests-shards')]),
         ('preflight-tests', [sys.executable, str(source / 'scripts/test_ci_preflight.py')]),
+        ('unittest-shards-tests',
+         [sys.executable, str(source / 'scripts/test_run_unittest_shards.py')]),
         ('native-c-surface-tests',
          [sys.executable, str(source / 'scripts/test_check_native_c_api_surface.py')]),
         ('kernel-residuals-tests',
@@ -867,8 +874,10 @@ def main() -> int:
                      'import subprocess,sys; '
                      'v=subprocess.check_output(["actionlint","-version"],text=True).splitlines()[0]; '
                      f'print("actionlint "+v); sys.exit(0 if v == {ACTIONLINT_VERSION!r} else 1)']
-    return run_checks([('actionlint-version', version_check), *check_commands(ROOT)],
-                      args.output_dir.resolve())
+    output_dir = args.output_dir.resolve()
+    return run_checks([('actionlint-version', version_check),
+                       *check_commands(ROOT, output_dir)],
+                      output_dir)
 
 
 if __name__ == '__main__':
